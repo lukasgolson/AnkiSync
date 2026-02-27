@@ -5,15 +5,17 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from supabase import create_client, Client
 import json
+import re
 from datetime import date, datetime, timedelta
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
+from sklearn.manifold import TSNE
 
 # ==========================================
 # PAGE CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Comprehensive Exam Dashboard", layout="wide", page_icon="🧠")
-st.title("🧠 Anki FSRS Exam Prep Dashboard")
+st.set_page_config(page_title="Lukas Comprehensive Exam Dashboard", layout="wide", page_icon="🧠")
+st.title("🧠 Lukas FSRS Comp Exam Prep Dashboard")
 
 
 # ==========================================
@@ -29,6 +31,14 @@ def init_connection():
 supabase = init_connection()
 
 
+def clean_html(raw_html):
+    """Strips HTML tags from Anki card text so the NLP engine only reads real words."""
+    if not isinstance(raw_html, str):
+        return ""
+    cleanr = re.compile('<.*?>')
+    return re.sub(cleanr, ' ', raw_html).strip()
+
+
 @st.cache_data(ttl=3600)
 def load_data():
     decks = pd.DataFrame(supabase.table('decks').select('*').execute().data)
@@ -39,6 +49,7 @@ def load_data():
     if not revlog.empty:
         revlog['review_datetime'] = pd.to_datetime(revlog['id'], unit='ms')
         revlog['review_date'] = revlog['review_datetime'].dt.date
+        revlog['hour'] = revlog['review_datetime'].dt.hour
         ease_map = {1: 'Again', 2: 'Hard', 3: 'Good', 4: 'Easy'}
         revlog['ease_label'] = revlog['ease'].map(ease_map)
 
@@ -64,6 +75,9 @@ def load_data():
         cards = cards.merge(notes.rename(columns={'id': 'nid', 'sfld': 'card_front', 'tags': 'tags'}), on='nid',
                             how='left')
 
+        # Clean HTML for the NLP map
+        cards['clean_text'] = cards['card_front'].apply(clean_html)
+
         def get_state(row):
             if row['type'] == 0:
                 return 'Unseen'
@@ -84,13 +98,23 @@ def load_data():
             last_reviews = revlog.groupby('cid')['review_datetime'].max().reset_index()
             last_reviews = last_reviews.rename(columns={'review_datetime': 'last_review_datetime'})
             cards = cards.merge(last_reviews, left_on='id', right_on='cid', how='left')
+
+            # 1. Predict Forgetting Date (When memory drops < 90%)
             cards['forgetting_date'] = cards['last_review_datetime'] + pd.to_timedelta(cards['s'], unit='D')
             cards['forgetting_date'] = cards['forgetting_date'].dt.date
+
+            # 2. Calculate Actual Due Date based on Anki Interval
+            def calc_due(row):
+                if pd.notnull(row['last_review_datetime']) and pd.notnull(row['ivl']) and row['type'] == 2:
+                    return (row['last_review_datetime'] + timedelta(days=row['ivl'])).date()
+                return None
+
+            cards['due_date'] = cards.apply(calc_due, axis=1)
 
     return decks, notes, cards, revlog
 
 
-with st.spinner("Loading Anki data from Supabase..."):
+with st.spinner("Loading & crunching Anki data..."):
     decks_df, notes_df, cards_df, revlog_df = load_data()
 
 if cards_df.empty or revlog_df.empty:
@@ -124,6 +148,7 @@ state_colors = {
     'Unseen':       '#9ca3af', 'Learning': '#facc15', 'Seen': '#fb923c',
     'Intermediate': '#60a5fa', 'Known': '#22c55e'
 }
+ease_colors = {'Again': '#ef4444', 'Hard': '#f59e0b', 'Good': '#22c55e', 'Easy': '#3b82f6'}
 
 # ==========================================
 # TOP LEVEL METRICS
@@ -162,64 +187,42 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Overview", "🧠 FSRS Decay", "🔍 Problem Cards", "🏷️ Tag Analytics", "🌌 3D Knowledge Map"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Tag Analytics", "🔍 Problem Cards", "🌌 3D Map", "🎯 Readiness"
 ])
 
-# --- TAB 1: OVERVIEW & PROGRESS ---
+# --- TAB 1: OVERVIEW ---
 with tab1:
     col_chart1, col_chart2 = st.columns([3, 2])
     with col_chart1:
         st.subheader("Daily Review Volume & Cumulative Total")
         if not filtered_revlog.empty:
-            # 1. Prepare data for stacked bars
             daily_reviews = filtered_revlog.groupby(['review_date', 'ease_label']).size().reset_index(name='count')
-
-            # 2. Prepare data for cumulative line
             daily_totals = filtered_revlog.groupby('review_date').size().reset_index(name='daily_total').sort_values(
                 'review_date')
             daily_totals['cumulative'] = daily_totals['daily_total'].cumsum()
 
-            # 3. Create figure with secondary Y-axis
             fig_bar = make_subplots(specs=[[{"secondary_y": True}]])
-
-            color_map = {'Again': '#ef4444', 'Hard': '#f59e0b', 'Good': '#22c55e', 'Easy': '#3b82f6'}
-
-            # Add stacked bars
             for ease in ['Again', 'Hard', 'Good', 'Easy']:
                 ease_data = daily_reviews[daily_reviews['ease_label'] == ease]
                 if not ease_data.empty:
-                    fig_bar.add_trace(
-                        go.Bar(x=ease_data['review_date'], y=ease_data['count'], name=ease,
-                               marker_color=color_map[ease]),
-                        secondary_y=False,
-                    )
+                    fig_bar.add_trace(go.Bar(x=ease_data['review_date'], y=ease_data['count'], name=ease,
+                                             marker_color=ease_colors[ease]), secondary_y=False)
 
-            # Add cumulative line
             fig_bar.add_trace(
-                go.Scatter(
-                    x=daily_totals['review_date'], y=daily_totals['cumulative'],
-                    name='Cumulative Reviews', mode='lines',
-                    line=dict(color='#8b5cf6', width=3)  # Distinct purple line
-                ),
-                secondary_y=True,
-            )
-
-            # Format layout
+                go.Scatter(x=daily_totals['review_date'], y=daily_totals['cumulative'], name='Cumulative Reviews',
+                           mode='lines', line=dict(color='#8b5cf6', width=3)), secondary_y=True)
             fig_bar.update_layout(barmode='stack', hovermode="x unified", margin=dict(t=10))
             fig_bar.update_yaxes(title_text="Daily Reviews", secondary_y=False)
             fig_bar.update_yaxes(title_text="Total Cumulative", secondary_y=True, showgrid=False)
-
             st.plotly_chart(fig_bar, use_container_width=True)
 
     with col_chart2:
         st.subheader("Knowledge Mastery Breakdown")
         state_counts = filtered_cards['knowledge_state'].value_counts().reset_index()
         state_counts.columns = ['State', 'Count']
-        fig_pie = px.pie(
-            state_counts, values='Count', names='State', hole=0.4,
-            color='State', color_discrete_map=state_colors
-        )
+        fig_pie = px.pie(state_counts, values='Count', names='State', hole=0.4, color='State',
+                         color_discrete_map=state_colors)
         st.plotly_chart(fig_pie, use_container_width=True)
 
     st.divider()
@@ -252,37 +255,90 @@ with tab1:
             fig_create.update_traces(line_color="#8b5cf6")
             st.plotly_chart(fig_create, use_container_width=True)
 
-# --- TAB 2: FSRS & MEMORY DECAY ---
+# --- TAB 2: FUTURE WORKLOAD & DECAY ---
 with tab2:
-    st.subheader("Predicted Memory Decay Timeline")
+    col_future1, col_future2 = st.columns(2)
     today = date.today()
-    future_forgets = filtered_cards[filtered_cards['forgetting_date'] >= today]
-    if not future_forgets.empty:
-        decay_counts = future_forgets.groupby('forgetting_date').size().reset_index(name='cards_decaying')
-        fig_decay = px.area(decay_counts, x='forgetting_date', y='cards_decaying', color_discrete_sequence=['#ef4444'])
-        fig_decay.update_xaxes(range=[today, today + pd.Timedelta(days=180)])
-        st.plotly_chart(fig_decay, use_container_width=True)
+
+    with col_future1:
+        st.subheader("📅 Workload Forecast")
+        st.markdown(f"Cards actively scheduled for review by Anki leading up to **{exam_date}**.")
+        future_due = filtered_cards[(filtered_cards['due_date'] >= today) & (filtered_cards['due_date'] <= exam_date)]
+
+        if not future_due.empty:
+            due_counts = future_due.groupby('due_date').size().reset_index(name='cards_due')
+            fig_due = px.bar(due_counts, x='due_date', y='cards_due',
+                             labels={'due_date': 'Date', 'cards_due': 'Cards Due'}, color_discrete_sequence=['#3b82f6'])
+            st.plotly_chart(fig_due, use_container_width=True)
+        else:
+            st.info("No future reviews scheduled in this timeframe.")
+
+    with col_future2:
+        st.subheader("📉 Predicted Memory Decay")
+        st.markdown("The natural decay curve: when the retention of a card falls below 90% if left unreviewed.")
+        future_forgets = filtered_cards[
+            (filtered_cards['forgetting_date'] >= today) & (filtered_cards['forgetting_date'] <= exam_date)]
+
+        if not future_forgets.empty:
+            decay_counts = future_forgets.groupby('forgetting_date').size().reset_index(name='cards_decaying')
+            fig_decay = px.area(decay_counts, x='forgetting_date', y='cards_decaying',
+                                labels={'forgetting_date': 'Date', 'cards_decaying': 'Cards Dropping < 90%'},
+                                color_discrete_sequence=['#ef4444'])
+            st.plotly_chart(fig_decay, use_container_width=True)
+        else:
+            st.info("Not enough FSRS review data to project memory decay.")
 
     st.divider()
     st.subheader("FSRS Memory State: Difficulty vs. Stability")
     fsrs_plot_df = filtered_cards.dropna(subset=['d', 's', 'card_front'])
     if not fsrs_plot_df.empty:
         fig_scatter = px.scatter(
-            fsrs_plot_df, x='d', y='s', hover_data=['card_front', 'lapses', 'reps'],
-            color='deck_name' if selected_deck == "All Decks" else None, opacity=0.6
+            fsrs_plot_df, x='d', y='s', hover_data=['clean_text', 'lapses', 'reps'],
+            color='deck_name' if selected_deck == "All Decks" else None, opacity=0.6,
+            labels={'d': 'Difficulty (1-10)', 's': 'Stability (Days until forgotten)'}
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
 
-# --- TAB 3: PROBLEM CARDS ---
+# --- TAB 3: STUDY OPTIMIZATION ---
 with tab3:
-    st.subheader("Leech & High-Difficulty Cards")
-    fsrs_plot_df = filtered_cards.dropna(subset=['d', 's', 'card_front'])
-    if not fsrs_plot_df.empty:
-        problem_cards = fsrs_plot_df[
-            ['card_front', 'deck_name', 'knowledge_state', 'd', 's', 'lapses', 'forgetting_date']].sort_values(
-            by=['d', 'lapses'], ascending=[False, False])
-        problem_cards = problem_cards.rename(columns={'d': 'Difficulty', 's': 'Stability (Days)'})
-        st.dataframe(problem_cards, use_container_width=True, hide_index=True, height=500)
+    col_opt1, col_opt2 = st.columns(2)
+
+    with col_opt1:
+        st.subheader("⏰ Retention by Hour")
+        st.markdown("The time of day when my brain is most primed for learning.")
+        if not filtered_revlog.empty:
+            hourly_stats = filtered_revlog.groupby('hour').agg(
+                total_reviews=('id', 'count'),
+                passed_reviews=('ease', lambda x: (x > 1).sum())
+            ).reset_index()
+            hourly_stats['retention'] = (hourly_stats['passed_reviews'] / hourly_stats['total_reviews']) * 100
+
+            # Filter out extreme outliers (e.g., hours where you only did 2 reviews ever)
+            hourly_stats = hourly_stats[hourly_stats['total_reviews'] > 10]
+
+            fig_hour = px.line(
+                hourly_stats, x='hour', y='retention', markers=True,
+                labels={'hour': 'Hour of Day (24h)', 'retention': 'True Retention %'},
+                title="When am I most accurate?"
+            )
+            fig_hour.update_traces(line_color="#10b981", line_width=3)
+            # Add a baseline threshold line for 90% FSRS target
+            fig_hour.add_hline(y=90, line_dash="dash", line_color="red", annotation_text="90% FSRS Target")
+            st.plotly_chart(fig_hour, use_container_width=True)
+
+    with col_opt2:
+        st.subheader("🎯 Button Bias Analysis")
+        st.markdown("My historic button press history")
+        if not filtered_revlog.empty:
+            button_counts = filtered_revlog['ease_label'].value_counts().reset_index()
+            button_counts.columns = ['Button', 'Count']
+            fig_buttons = px.bar(
+                button_counts, x='Button', y='Count', color='Button',
+                color_discrete_map=ease_colors,
+                text='Count'
+            )
+            fig_buttons.update_traces(textposition='outside')
+            st.plotly_chart(fig_buttons, use_container_width=True)
 
 # --- TAB 4: TAG ANALYTICS ---
 with tab4:
@@ -308,53 +364,124 @@ with tab4:
                     st.dataframe(tag_stats.sort_values(by='avg_difficulty', ascending=False), use_container_width=True,
                                  hide_index=True, height=500)
 
-# --- TAB 5: 3D KNOWLEDGE MAP ---
+# --- TAB 5: PROBLEM CARDS ---
 with tab5:
-    st.subheader("🌌 3D Semantic Knowledge Map")
+    st.subheader("Leech & High-Difficulty Cards")
+    fsrs_plot_df = filtered_cards.dropna(subset=['d', 's', 'clean_text'])
+    if not fsrs_plot_df.empty:
+        problem_cards = fsrs_plot_df[
+            ['clean_text', 'deck_name', 'knowledge_state', 'd', 's', 'lapses', 'due_date']].sort_values(
+            by=['d', 'lapses'], ascending=[False, False])
+        problem_cards = problem_cards.rename(
+            columns={'clean_text': 'Card Text', 'd': 'Difficulty', 's': 'Stability (Days)',
+                     'due_date':   'Anki Due Date'})
+        st.dataframe(problem_cards, use_container_width=True, hide_index=True, height=500)
+
+# --- TAB 6: 3D t-SNE KNOWLEDGE MAP ---
+with tab6:
+    st.subheader("🌌 3D Semantic Knowledge Map (t-SNE)")
     st.markdown("""
     **How to read this map:**
-    * **The Geometry (X, Y, Z Axes):** We used Principal Component Analysis (PCA) to combine your flashcard text and tags, compressing thousands of concepts into 3 main topics of variance. Cards sitting close to each other conceptually mean the same thing.
-    * **The Color (Difficulty):** Dark Blue/Green means the card is easy. **Bright Red/Orange means the card is brutally hard (Difficulty > 8).** *Spin the graph to look for "Red Galaxies"—these are entire conceptual topics you are struggling with!*
+    * **The Geometry:** I ran my flashcards through a machine-learning pipeline (SVD compression followed by t-SNE math). This clusters cards into highly distinct "islands" of meaning.
+    * **The Color (Difficulty):** Dark Blue/Green = Easy. **Bright Red = Brutally Hard (Difficulty > 8).** *Spin the graph and look for dense clusters of Red...*
     """)
 
-    map_df = filtered_cards.dropna(subset=['card_front', 'd']).copy()
+    map_df = filtered_cards.dropna(subset=['clean_text', 'd']).copy()
 
-    if len(map_df) > 10:
-        with st.spinner("Calculating 3D semantic vectors..."):
-            map_df['combined_features'] = map_df['card_front'].astype(str) + " " + map_df['tags'].astype(str).fillna("")
+    if len(map_df) > 30:  # t-SNE needs a bit more data to perform well
+        with st.spinner("Calculating 3D t-SNE semantic vectors (this takes a few seconds)..."):
+            # 1. Combine Clean Text and Tags
+            map_df['combined_features'] = map_df['clean_text'].astype(str) + " " + map_df['tags'].astype(str).fillna("")
+
+            # 2. Convert to Math (TF-IDF)
             vectorizer = TfidfVectorizer(stop_words='english', max_features=2000)
             X = vectorizer.fit_transform(map_df['combined_features'])
 
-            svd = TruncatedSVD(n_components=3, random_state=42)
-            coords = svd.fit_transform(X)
+            # 3. Pipeline: SVD to compress sparse data -> t-SNE for localized clustering
+            svd = TruncatedSVD(n_components=min(50, X.shape[1] - 1), random_state=42)
+            X_reduced = svd.fit_transform(X)
 
-            map_df['PC1 (Primary Topic Variance)'] = coords[:, 0]
-            map_df['PC2 (Secondary Topic Variance)'] = coords[:, 1]
-            map_df['PC3 (Tertiary Topic Variance)'] = coords[:, 2]
+            # Adjust perplexity based on dataset size to prevent math errors
+            perplexity_val = min(30, len(map_df) - 1)
+            tsne = TSNE(n_components=3, random_state=42, perplexity=perplexity_val)
+            coords = tsne.fit_transform(X_reduced)
+
+            map_df['Map X'] = coords[:, 0]
+            map_df['Map Y'] = coords[:, 1]
+            map_df['Map Z'] = coords[:, 2]
 
             fig_map = px.scatter_3d(
                 map_df,
-                x='PC1 (Primary Topic Variance)',
-                y='PC2 (Secondary Topic Variance)',
-                z='PC3 (Tertiary Topic Variance)',
+                x='Map X',
+                y='Map Y',
+                z='Map Z',
                 color='d',
                 color_continuous_scale='Turbo',
                 hover_name='deck_name',
                 hover_data={
-                    'PC1 (Primary Topic Variance)':   False,
-                    'PC2 (Secondary Topic Variance)': False,
-                    'PC3 (Tertiary Topic Variance)':  False,
-                    'card_front':                     True,
-                    'tags':                           True,
-                    'd':                              True,
-                    's':                              True,
-                    'knowledge_state':                True
+                    'Map X':      False, 'Map Y': False, 'Map Z': False,
+                    'clean_text': True, 'tags': True, 'd': True, 's': True, 'knowledge_state': True
                 },
                 opacity=0.7,
                 height=800
             )
 
             fig_map.update_traces(marker=dict(size=4))
+            # Hide axes for a true "Galaxy" effect
+            fig_map.update_layout(scene=dict(
+                xaxis=dict(showbackground=False, showticklabels=False, title=''),
+                yaxis=dict(showbackground=False, showticklabels=False, title=''),
+                zaxis=dict(showbackground=False, showticklabels=False, title='')
+            ))
             st.plotly_chart(fig_map, use_container_width=True)
     else:
-        st.info("You need at least 10 reviewed cards to generate a 3D semantic map.")
+        st.info("There are not enough reviewed cards to generate a high-quality t-SNE semantic map.")
+
+# --- TAB 7: MASTER READINESS SUPER-CLUSTER ---
+with tab7:
+    st.subheader("🎯 Master Readiness Super-Cluster")
+    st.markdown("""
+    **The 'One Big Picture' of my Exam Preparedness:**
+    This sunburst cluster represents my entire brain's current state regarding the exam. 
+    * **Size** = Number of cards in that category. 
+    * **Color** = Average FSRS Difficulty (Green = Easy/Mastered, Red = Brutally Hard). 
+    * *Interactive:* Click on any slice (like a specific deck) to zoom into that sub-cluster!
+    """)
+
+    # Drop rows missing the core categorization data
+    cluster_df = filtered_cards.dropna(subset=['deck_name', 'knowledge_state', 'd']).copy()
+
+    if not cluster_df.empty:
+        # Group the data hierarchically: Deck -> Knowledge State
+        cluster_stats = cluster_df.groupby(['deck_name', 'knowledge_state']).agg(
+            card_count=('id', 'count'),
+            avg_difficulty=('d', 'mean')
+        ).reset_index()
+
+        # Add a root node so everything clusters into one giant entity
+        cluster_stats['Exam'] = 'April 14 Exam'
+
+        fig_cluster = px.sunburst(
+            cluster_stats,
+            path=['Exam', 'deck_name', 'knowledge_state'],
+            values='card_count',
+            color='avg_difficulty',
+            # RdYlGn_r is a Red-Yellow-Green scale, reversed so low difficulty (1) is Green and high (10) is Red
+            color_continuous_scale='RdYlGn_r',
+            range_color=[1, 10],  # Lock the color scale to the strict 1-10 FSRS difficulty range
+            hover_data={'card_count': True, 'avg_difficulty': ':.2f'}
+        )
+
+        fig_cluster.update_layout(
+            margin=dict(t=20, l=10, r=10, b=10),
+            height=750
+        )
+
+        # Clean up the hover text for readability
+        fig_cluster.update_traces(
+            hovertemplate='<b>%{id}</b><br>Cards: %{value}<br>Avg Difficulty: %{color:.2f}'
+        )
+
+        st.plotly_chart(fig_cluster, use_container_width=True)
+    else:
+        st.info("Not enough data to generate the master cluster.")
