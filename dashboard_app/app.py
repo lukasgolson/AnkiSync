@@ -277,7 +277,7 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, tab6, tab7, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, mapping, tab7, tab9 = st.tabs([
     "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness", "Game"
 ])
 
@@ -503,7 +503,6 @@ with tab3:
 
 
 # --- TAB 4: TAG ANALYTICS ---
-# --- TAB 4: REFINED TAG ANALYTICS ---
 with tab4:
     st.subheader("🏷️ Subject Difficulty by Tag")
 
@@ -581,125 +580,161 @@ with tab4:
 
 
 # --- TAB 6: CLEANED 3D t-SNE MAP ---
-with tab6:
+with mapping:
 
     subtab_cards, subtab_Meta = st.tabs(["Semantic Knowledge", "Heuristic Strategy"])
 
     with subtab_cards:
         st.markdown("""
-                This map clusters cards based on their semantic meaning (using the cleaned text of the card fronts and tags).
-                * **Color:** Difficulty (Red = Hardest, Purple = Mastered)
-                """)
+        This map clusters cards based on their **deep semantic meaning** (using AI embeddings).
+        * **Nodes (Dots):** Individual flashcards. Color is Difficulty (Red = Hardest).
+        * **Islands:** Formed by density. Outliers (Noise) are left unclustered to preserve accuracy.
+        * **The Web (Lines):** Connects cards across the space that share a high semantic similarity.
+        """)
 
-        # Define a sidebar control for "Words to Ignore"
+        # 1. Map & Web Settings
         st.sidebar.divider()
-        st.sidebar.header("🌌 Map Settings")
-
-        # 1. Define ALL controls at the top to avoid NameErrors
-        manual_ignore = st.sidebar.text_input("Extra Words to Ignore (comma separated)", "")
+        st.sidebar.header("🌌 Map & Web Settings")
         show_labels = st.sidebar.checkbox("Show Island Labels", value=True)
-        num_clusters = st.sidebar.slider("Number of Concept Islands", 3, 15, 8)
-        custom_perplexity = st.sidebar.slider("Map Detail (Perplexity)", 5, 50, 15)
+        min_cluster_size = st.sidebar.slider("Min Cards per Island", 3, 20, 5)
+        custom_neighbors = st.sidebar.slider("Map Detail (Neighbors)", 5, 50, 15)
+        edge_threshold = st.sidebar.slider("Web Threshold (Similarity)", 0.60, 0.95, 0.75, 0.01)
 
         map_df = filtered_cards.dropna(subset=['clean_text', 'd']).copy()
 
         if len(map_df) > 30:
-            with st.spinner("Purging citations and calculating t-SNE..."):
+            with st.spinner("Generating dense semantic embeddings and mapping the knowledge space..."):
+
+                # 2. Load Local Embedding Model
+                @st.cache_resource
+                def load_embedder():
+                    from sentence_transformers import SentenceTransformer
+                    return SentenceTransformer('all-MiniLM-L6-v2')
 
 
-                all_stops = GLOBAL_STOP_WORDS
+                embedder = load_embedder()
 
 
-                # 3. Scientific Purge Function
-                # 3. Scientific Purge Function (Updated to strip numbers/dates)
-                def purge_noise(text):
-                    # 1. Lowercase and remove punctuation/special chars
-                    text = re.sub(r'[^\w\s]', ' ', str(text).lower())
-
-                    # 2. Split into tokens
-                    tokens = re.split(r'[ _]', text)
-
-                    clean_tokens = []
-                    for t in tokens:
-                        # Ignore if the token is a number or contains digits (dates, measurements)
-                        if any(char.isdigit() for char in t):
-                            continue
-
-                        # Ignore common noise and short fragments (et, al, s2)
-                        if len(t) > 3 and t not in all_stops:
-                            clean_tokens.append(t)
-
-                    return " ".join(clean_tokens)
+                # 3. Clean Text (Fixing the Underscore Issue)
+                def clean_for_embeddings(text, tags):
+                    # Replace underscores with spaces BEFORE the regex so tags are read as distinct words
+                    raw = f"{text} {tags}".replace('_', ' ')
+                    clean_text = re.sub(r'[^\w\s]', ' ', str(raw).lower())
+                    return clean_text
 
 
-                map_df['nlp_ready_text'] = map_df['clean_text'].apply(purge_noise)
-                map_df['nlp_ready_tags'] = map_df['tags'].apply(purge_noise)
-                map_df['combined_features'] = map_df['nlp_ready_text'] + " " + map_df['nlp_ready_tags']
+                map_df['nlp_ready'] = map_df.apply(lambda x: clean_for_embeddings(x['clean_text'], x['tags']), axis=1)
 
-                # 4. Math Pipeline
-                vectorizer = TfidfVectorizer(
-                    stop_words='english',
-                    max_features=1500,  # Increased to account for extra phrase tokens
-                    max_df=0.4,
-                    min_df=3,
-                    ngram_range=(1, 3)
-                )
-                X = vectorizer.fit_transform(map_df['combined_features'])
 
-                svd = TruncatedSVD(n_components=min(50, X.shape[1] - 1), random_state=42)
-                X_reduced = svd.fit_transform(X)
+                # 4. Generate Dense Embeddings
+                @st.cache_data
+                def get_embeddings(text_list):
+                    return embedder.encode(text_list, show_progress_bar=False)
 
-                # custom_perplexity is now safely defined at the top of the block
-                final_perp = min(custom_perplexity, len(map_df) - 1)
 
-                tsne = TSNE(
+                embeddings = get_embeddings(map_df['nlp_ready'].tolist())
+
+                import umap
+                import hdbscan
+                from sklearn.metrics.pairwise import cosine_similarity
+
+                # 5. UMAP Dimensionality Reduction (3D)
+                final_neighbors = min(custom_neighbors, len(map_df) - 1)
+                reducer = umap.UMAP(
                     n_components=3,
-                    random_state=42,
-                    perplexity=final_perp,
-                    init='pca',
-                    learning_rate='auto'
+                    n_neighbors=final_neighbors,
+                    min_dist=0.1,
+                    metric='cosine',
+                    random_state=42
                 )
-                coords = tsne.fit_transform(X_reduced)
+                coords = reducer.fit_transform(embeddings)
 
-                map_df['Map X'], map_df['Map Y'], map_df['Map Z'] = coords[:, 0], coords[:, 1], coords[:, 2]
+                map_df['Map X'] = coords[:, 0]
+                map_df['Map Y'] = coords[:, 1]
+                map_df['Map Z'] = coords[:, 2]
 
-                # 5. K-Means for Island Labelling
-                kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init='auto')
-                map_df['cluster'] = kmeans.fit_predict(coords)
+                # 6. HDBSCAN Density-Based Clustering
+                clusterer = hdbscan.HDBSCAN(
+                    min_cluster_size=min_cluster_size,
+                    metric='euclidean',
+                    cluster_selection_method='eom'
+                )
+                map_df['cluster'] = clusterer.fit_predict(coords)
 
+                # 7. Extract Semantic Labels (Fixing the IndexError & Trigrams)
                 cluster_labels = {}
                 if show_labels:
-                    feature_names = vectorizer.get_feature_names_out()
+                    all_stops = GLOBAL_STOP_WORDS
 
-                    for i in range(num_clusters):
-                        cluster_indices = map_df[map_df['cluster'] == i].index
-                        # Calculate mean TF-IDF for this cluster to find 'signature' phrases
-                        cluster_tfidf = X[map_df.index.get_indexer(cluster_indices)].mean(axis=0).A1
+                    grouped_docs = map_df.groupby('cluster')['nlp_ready'].apply(lambda x: ' '.join(x)).reset_index()
 
-                        # Sort by highest score
-                        top_indices = cluster_tfidf.argsort()[::-1]
+                    # FIX: Filter out noise (-1) AND reset the index so it matches the 0-based SciPy matrix
+                    valid_docs = grouped_docs[grouped_docs['cluster'] != -1].reset_index(drop=True)
 
-                        # Logic: Prioritize the highest scoring n-gram that isn't noise
-                        best_label = f"Cluster {i}"
-                        for idx in top_indices:
-                            candidate = feature_names[idx]
-                            # Ensure the label isn't just a citation or one of your stop words
-                            if not any(stop in candidate for stop in all_stops):
-                                best_label = candidate.upper()
-                                break
-                        cluster_labels[i] = best_label
+                    if not valid_docs.empty:
+                        # Restored ngram_range=(1, 3) for highly specific medical/scientific labels
+                        vectorizer = TfidfVectorizer(stop_words='english', max_features=1000, ngram_range=(1, 3))
+                        tfidf_matrix = vectorizer.fit_transform(valid_docs['nlp_ready'])
+                        feature_names = vectorizer.get_feature_names_out()
 
-                # 6. Final 3D Plot
+                        for i, row in valid_docs.iterrows():
+                            cluster_id = row['cluster']
+                            tfidf_scores = tfidf_matrix[i].toarray()[0]
+                            top_indices = tfidf_scores.argsort()[::-1]
+
+                            best_label = f"Concept {cluster_id}"
+                            for idx in top_indices:
+                                candidate = feature_names[idx]
+
+                                # Safeguard against bad tokens
+                                has_stop = any(stop in candidate for stop in all_stops)
+                                has_digit = any(char.isdigit() for char in candidate)
+                                has_underscore = '_' in candidate
+
+                                if not has_stop and not has_digit and not has_underscore and len(candidate) > 4:
+                                    best_label = candidate.upper()
+                                    break
+                            cluster_labels[cluster_id] = best_label
+
+                # 8. Build the Semantic Web (Edges)
+                sim_matrix = cosine_similarity(embeddings)
+                edge_x = []
+                edge_y = []
+                edge_z = []
+
+                # Loop to find connections and build the line trace (upper triangle to avoid duplicates)
+                for i in range(len(map_df)):
+                    for j in range(i + 1, len(map_df)):
+                        if sim_matrix[i, j] > edge_threshold:
+                            edge_x.extend([map_df['Map X'].iloc[i], map_df['Map X'].iloc[j], None])
+                            edge_y.extend([map_df['Map Y'].iloc[i], map_df['Map Y'].iloc[j], None])
+                            edge_z.extend([map_df['Map Z'].iloc[i], map_df['Map Z'].iloc[j], None])
+
+                # 9. Final 3D Plot Assembly
                 fig_map = px.scatter_3d(
                     map_df, x='Map X', y='Map Y', z='Map Z',
                     color='d', color_continuous_scale='Turbo',
                     hover_name='deck_name',
-                    hover_data={'Map X': False, 'Map Y': False, 'Map Z': False, 'clean_text': True, 'd': True},
-                    opacity=0.7, height=800
+                    hover_data={
+                        'Map X':      False, 'Map Y': False, 'Map Z': False,
+                        'clean_text': True, 'd': True, 'cluster': True
+                    },
+                    opacity=0.9, height=800
                 )
 
+                # Add the Web Layer (Lines)
+                fig_map.add_trace(go.Scatter3d(
+                    x=edge_x, y=edge_y, z=edge_z,
+                    mode='lines',
+                    line=dict(color='rgba(150, 150, 150, 0.2)', width=1),
+                    hoverinfo='none',
+                    showlegend=False
+                ))
+
+                # Add the Text Labels Layer
                 if show_labels:
-                    centers = map_df.groupby('cluster')[['Map X', 'Map Y', 'Map Z']].mean().reset_index()
+                    centers = map_df[map_df['cluster'] != -1].groupby('cluster')[
+                        ['Map X', 'Map Y', 'Map Z']].mean().reset_index()
                     for _, row in centers.iterrows():
                         label = cluster_labels.get(row['cluster'], "")
                         fig_map.add_trace(go.Scatter3d(
@@ -718,8 +753,37 @@ with tab6:
                     zaxis=dict(showbackground=False, showticklabels=False, title='')
                 ))
                 st.plotly_chart(fig_map, use_container_width=True)
+
+                # 10. Target Acquisition Metrics (Top 3 Hardest Islands)
+                st.divider()
+                st.subheader("🌋 Target Acquisition: Top 3 Hardest Concept Islands")
+
+                valid_clusters = map_df[map_df['cluster'] != -1]
+
+                if not valid_clusters.empty:
+                    island_stats = valid_clusters.groupby('cluster').agg(
+                        avg_diff=('d', 'mean'),
+                        card_count=('id', 'count')
+                    ).reset_index()
+
+                    hardest_islands = island_stats.sort_values(by='avg_diff', ascending=False).head(3)
+                    cols = st.columns(len(hardest_islands))
+
+                    for idx, (_, row) in enumerate(hardest_islands.iterrows()):
+                        cluster_id = int(row['cluster'])
+                        concept_name = cluster_labels.get(cluster_id, f"Concept {cluster_id}")
+
+                        with cols[idx]:
+                            st.metric(
+                                label=f"🏝️ {concept_name} (Cards: {int(row['card_count'])})",
+                                value=f"Friction: {row['avg_diff']:.2f}/10"
+                            )
+                else:
+                    st.info("Not enough clear conceptual islands formed to calculate targets.")
+
         else:
             st.info("You need at least 30 cards to generate this map.")
+
 
     with subtab_Meta:
         st.markdown("""

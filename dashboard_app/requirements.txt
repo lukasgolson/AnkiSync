@@ -4,3 +4,7 @@ supabase
 plotly
 scikit-learn
 python-dotenv
+sentence-transformers
+umap-learn
+hdbscan
+matplotlib
