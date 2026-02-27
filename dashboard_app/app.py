@@ -1,15 +1,17 @@
-import streamlit as st
+import json
+import re
+from datetime import date, timedelta
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 from plotly.subplots import make_subplots
-from supabase import create_client, Client
-import json
-import re
-from datetime import date, datetime, timedelta
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.manifold import TSNE
+from supabase import create_client
 
 # ==========================================
 # PAGE CONFIGURATION
@@ -341,28 +343,67 @@ with tab3:
             st.plotly_chart(fig_buttons, use_container_width=True)
 
 # --- TAB 4: TAG ANALYTICS ---
+# --- TAB 4: REFINED TAG ANALYTICS ---
 with tab4:
-    st.subheader("🏷️ Subject Difficulty by Tag")
+    st.subheader("🏷️ Subject Difficulty by Tag (Cleaned)")
+
     tag_df = filtered_cards.dropna(subset=['d', 'tags']).copy()
+
     if not tag_df.empty:
-        tag_df['tag_list'] = tag_df['tags'].astype(str).str.strip().str.split(' ')
+        # 1. NEW CLEANING LOGIC: Split by space OR underscore
+        # We use a regex [ _] to catch both
+        tag_df['tag_list'] = tag_df['tags'].astype(str).str.strip().str.split(r'[ _]')
+
         exploded_tags = tag_df.explode('tag_list')
-        exploded_tags = exploded_tags[exploded_tags['tag_list'] != '']
+
+
+        # 2. FILTERING JUNK
+        def is_useful_tag(t):
+            t = t.lower().strip()
+            # Remove empty or tiny fragments
+            if len(t) < 3:
+                return False
+            # Remove paper citations/common noise
+            if t in ['moreau', 'payette', 'bauce', 'allen', 'rademacher', 'results', 'discussion', 'background']:
+                return False
+            # Remove strings that are likely IDs (mix of letters and numbers with length > 5)
+            if any(char.isdigit() for char in t) and any(char.isalpha() for char in t) and len(t) > 5:
+                return False
+            return True
+
+
+        exploded_tags = exploded_tags[exploded_tags['tag_list'].apply(is_useful_tag)]
+
         if not exploded_tags.empty:
-            tag_stats = exploded_tags.groupby('tag_list').agg(avg_difficulty=('d', 'mean'), avg_stability=('s', 'mean'),
-                                                              card_count=('id', 'count')).reset_index()
+            tag_stats = exploded_tags.groupby('tag_list').agg(
+                avg_difficulty=('d', 'mean'),
+                avg_stability=('s', 'mean'),
+                card_count=('id', 'count')
+            ).reset_index()
+
+            # Show only conceptual tags with at least 5 cards
             tag_stats = tag_stats[tag_stats['card_count'] >= 5]
+
+            # Display hardest tags
             hardest_tags = tag_stats.sort_values(by='avg_difficulty', ascending=True).tail(20)
+
             if not hardest_tags.empty:
                 col_tag_chart, col_tag_data = st.columns([3, 2])
                 with col_tag_chart:
-                    fig_tags = px.bar(hardest_tags, x='avg_difficulty', y='tag_list', orientation='h',
-                                      color='avg_difficulty', color_continuous_scale='Reds')
+                    fig_tags = px.bar(
+                        hardest_tags, x='avg_difficulty', y='tag_list',
+                        orientation='h', color='avg_difficulty',
+                        color_continuous_scale='Reds',
+                        title="Top 20 Hardest Concepts (Cleaned)"
+                    )
                     fig_tags.update_xaxes(range=[1, 10])
                     st.plotly_chart(fig_tags, use_container_width=True)
+
                 with col_tag_data:
                     st.dataframe(tag_stats.sort_values(by='avg_difficulty', ascending=False), use_container_width=True,
-                                 hide_index=True, height=500)
+                                 hide_index=True)
+            else:
+                st.info("No conceptual tags met the filter criteria.")
 
 # --- TAB 5: PROBLEM CARDS ---
 with tab5:
@@ -378,56 +419,109 @@ with tab5:
         st.dataframe(problem_cards, use_container_width=True, hide_index=True, height=500)
 
 # --- TAB 6: 3D t-SNE KNOWLEDGE MAP ---
+# --- TAB 6: 3D t-SNE KNOWLEDGE MAP (With Auto-Labelling) ---
+# --- TAB 6: CLEANED 3D t-SNE MAP ---
+# --- TAB 6: CLEANED 3D t-SNE MAP ---
 with tab6:
-    st.subheader("🌌 3D Semantic Knowledge Map (t-SNE)")
-    st.markdown("""
-    **How to read this map:**
-    * **The Geometry:** I ran my flashcards through a machine-learning pipeline (SVD compression followed by t-SNE math). This clusters cards into highly distinct "islands" of meaning.
-    * **The Color (Difficulty):** Dark Blue/Green = Easy. **Bright Red = Brutally Hard (Difficulty > 8).** *Spin the graph and look for dense clusters of Red...*
-    """)
+    st.subheader("🌌 3D Semantic Knowledge Map (Scientific Concepts)")
+
+    # Define a sidebar control for "Words to Ignore"
+    st.sidebar.divider()
+    st.sidebar.header("🌌 Map Settings")
+
+    # 1. Define ALL controls at the top to avoid NameErrors
+    manual_ignore = st.sidebar.text_input("Extra Words to Ignore (comma separated)", "")
+    show_labels = st.sidebar.checkbox("Show Island Labels", value=True)
+    num_clusters = st.sidebar.slider("Number of Concept Islands", 3, 15, 8)
+    custom_perplexity = st.sidebar.slider("Map Detail (Perplexity)", 5, 50, 15)
 
     map_df = filtered_cards.dropna(subset=['clean_text', 'd']).copy()
 
-    if len(map_df) > 30:  # t-SNE needs a bit more data to perform well
-        with st.spinner("Calculating 3D t-SNE semantic vectors (this takes a few seconds)..."):
-            # 1. Combine Clean Text and Tags
-            map_df['combined_features'] = map_df['clean_text'].astype(str) + " " + map_df['tags'].astype(str).fillna("")
+    if len(map_df) > 30:
+        with st.spinner("Purging citations and calculating t-SNE..."):
 
-            # 2. Convert to Math (TF-IDF)
-            vectorizer = TfidfVectorizer(stop_words='english', max_features=2000)
+            # 2. Build the custom ignore list from your sidebar input
+            user_stop_words = [w.strip().lower() for w in manual_ignore.split(",") if w.strip()]
+            fixed_stop_words = ['moreau', 'payette', 'bauce', 'allen', 'rademacher', 'results', 'discussion',
+                                'background']
+            all_stops = fixed_stop_words + user_stop_words
+
+
+            # 3. Scientific Purge Function
+            def purge_noise(text):
+                tokens = re.split(r'[ _]', str(text).lower())
+                clean_tokens = [
+                    t for t in tokens
+                    if len(t) > 3
+                       and not (any(char.isdigit() for char in t) and any(char.isalpha() for char in t))
+                       and t not in all_stops
+                ]
+                return " ".join(clean_tokens)
+
+
+            map_df['nlp_ready_text'] = map_df['clean_text'].apply(purge_noise)
+            map_df['nlp_ready_tags'] = map_df['tags'].apply(purge_noise)
+            map_df['combined_features'] = map_df['nlp_ready_text'] + " " + map_df['nlp_ready_tags']
+
+            # 4. Math Pipeline
+            vectorizer = TfidfVectorizer(stop_words='english', max_features=1000, max_df=0.5, min_df=2)
             X = vectorizer.fit_transform(map_df['combined_features'])
 
-            # 3. Pipeline: SVD to compress sparse data -> t-SNE for localized clustering
             svd = TruncatedSVD(n_components=min(50, X.shape[1] - 1), random_state=42)
             X_reduced = svd.fit_transform(X)
 
-            # Adjust perplexity based on dataset size to prevent math errors
-            perplexity_val = min(30, len(map_df) - 1)
-            tsne = TSNE(n_components=3, random_state=42, perplexity=perplexity_val)
+            # custom_perplexity is now safely defined at the top of the block
+            final_perp = min(custom_perplexity, len(map_df) - 1)
+
+            tsne = TSNE(
+                n_components=3,
+                random_state=42,
+                perplexity=final_perp,
+                init='pca',
+                learning_rate='auto'
+            )
             coords = tsne.fit_transform(X_reduced)
 
-            map_df['Map X'] = coords[:, 0]
-            map_df['Map Y'] = coords[:, 1]
-            map_df['Map Z'] = coords[:, 2]
+            map_df['Map X'], map_df['Map Y'], map_df['Map Z'] = coords[:, 0], coords[:, 1], coords[:, 2]
 
+            # 5. K-Means for Island Labelling
+            kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init='auto')
+            map_df['cluster'] = kmeans.fit_predict(coords)
+
+            cluster_labels = {}
+            if show_labels:
+                for i in range(num_clusters):
+                    cluster_text = " ".join(map_df[map_df['cluster'] == i]['combined_features'])
+                    words = [w for w in re.findall(r'\w+', cluster_text.lower()) if len(w) > 4 and w not in all_stops]
+                    if words:
+                        most_common = max(set(words), key=words.count)
+                        cluster_labels[i] = most_common.upper()
+                    else:
+                        cluster_labels[i] = f"Group {i}"
+
+            # 6. Final 3D Plot
             fig_map = px.scatter_3d(
-                map_df,
-                x='Map X',
-                y='Map Y',
-                z='Map Z',
-                color='d',
-                color_continuous_scale='Turbo',
+                map_df, x='Map X', y='Map Y', z='Map Z',
+                color='d', color_continuous_scale='Turbo',
                 hover_name='deck_name',
-                hover_data={
-                    'Map X':      False, 'Map Y': False, 'Map Z': False,
-                    'clean_text': True, 'tags': True, 'd': True, 's': True, 'knowledge_state': True
-                },
-                opacity=0.7,
-                height=800
+                hover_data={'Map X': False, 'Map Y': False, 'Map Z': False, 'clean_text': True, 'd': True},
+                opacity=0.7, height=800
             )
 
+            if show_labels:
+                centers = map_df.groupby('cluster')[['Map X', 'Map Y', 'Map Z']].mean().reset_index()
+                for _, row in centers.iterrows():
+                    label = cluster_labels.get(row['cluster'], "")
+                    fig_map.add_trace(go.Scatter3d(
+                        x=[row['Map X']], y=[row['Map Y']], z=[row['Map Z']],
+                        mode='text',
+                        text=[f"<b>{label}</b>"],
+                        textfont=dict(color='white', size=14),
+                        showlegend=False,
+                        hoverinfo='none'
+                    ))
+
             fig_map.update_traces(marker=dict(size=4))
-            # Hide axes for a true "Galaxy" effect
             fig_map.update_layout(scene=dict(
                 xaxis=dict(showbackground=False, showticklabels=False, title=''),
                 yaxis=dict(showbackground=False, showticklabels=False, title=''),
@@ -435,7 +529,7 @@ with tab6:
             ))
             st.plotly_chart(fig_map, use_container_width=True)
     else:
-        st.info("There are not enough reviewed cards to generate a high-quality t-SNE semantic map.")
+        st.info("You need at least 30 cards to generate this map.")
 
 # --- TAB 7: MASTER READINESS SUPER-CLUSTER ---
 with tab7:
