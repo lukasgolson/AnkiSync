@@ -283,6 +283,25 @@ tab1, tab2, tab3, tab4, tab6, tab7, tab9 = st.tabs([
 
 # --- TAB 1: OVERVIEW ---
 with tab1:
+
+    with st.expander("📖 About this Dashboard: A Data-Driven Approach to Comp Prep", expanded=True):
+        st.markdown("""
+        I built this custom dashboard to take a quantitative, data-driven approach to my comprehensive exam prep. Instead of just guessing how well I know the material, this app pulls my raw flashcard data (from Anki) and uses a few data science techniques to measure my actual progress.
+
+        ### 🧠 The Memory Engine: FSRS
+        Under the hood, this dashboard uses the **Free Spaced Repetition Scheduler (FSRS)**, a machine-learning algorithm that tracks how memory decays over time. For every single concept I study, the engine calculates:
+
+        * **Stability ($S$):** My *Memory Depth* (in days). This is the algorithm's estimate of how long it will take for my recall probability to drop to 90%. 
+        * **Difficulty ($D$):** The *Cognitive Friction* (1-10 scale). This tracks how fundamentally difficult a specific concept is for me to grasp, adjusting automatically based on my failure rates.
+        * **Retrievability ($R$):** My *Current Recall Probability* ($R = 0.9^{\\frac{t}{S}}$). The exact likelihood that I would remember the concept if tested today.
+
+        ### 🌌 Mapping the Knowledge (NLP)
+        I wanted to be able to visualize my knowledge geographically, so I added a Natural Language Processing pipeline. By applying **TF-IDF vectorization** and **K-Means clustering** to the raw text of my study materials, the app automatically groups related scientific concepts into "semantic islands." This powers the 3D map, letting me visually track which specific domains are stable and which are lagging.
+
+        ### ⚔️ Gamifying the Grind
+        Studying for comps is a marathon, so to keep the daily grind engaging, I built an RPG-style "Adventurer's Guild" on top of the data. The gamification is strictly tied to real metrics: my "XP" and "Gold" are mathematically derived from my FSRS Stability and True Retention. If a specific cluster of knowledge starts fading from my memory, the app spawns it as a "Boss" that I have to go review to defeat.
+        """)
+
     col_chart1, col_chart2 = st.columns([3, 2])
     with col_chart1:
         st.subheader("Daily Review Volume & Cumulative Total")
