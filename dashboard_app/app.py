@@ -1,4 +1,5 @@
 import json
+import random
 import re
 from datetime import date, timedelta
 
@@ -12,6 +13,17 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.manifold import TSNE
 from supabase import create_client
+
+
+GLOBAL_STOP_WORDS = set([
+    'this', 'that', 'with', 'from', 'what', 'which', 'where', 'when', 'how', 'have',
+    'will', 'about', 'these', 'those', 'their', 'there', 'they', 'because', 'other',
+    'some', 'such', 'into', 'over', 'after', 'more', 'most', 'only', 'also', 'even',
+    'very', 'just', 'like', 'well', 'many', 'much', 'each', 'every', 'both', 'between',
+    'through', 'under', 'below', 'above', 'before', 'since', 'during', 'without',
+    'within', 'among', 'along', 'against', 'until', 'despite', 'towards', 'moreau',
+    'payette', 'bauce', 'allen', 'rademacher', 'results', 'discussion', 'background'
+])
 
 # ==========================================
 # PAGE CONFIGURATION
@@ -133,26 +145,40 @@ def update_user_stats(updates):
 
 
 def calculate_rpg_state(cards_df, revlog_df, db_stats):
-    """Calculates the current state of the player based on deck performance."""
-    # 1. Base Stats
+    """Calculates the current state of the player based on deck performance and database ledger."""
     mature_count = len(cards_df[cards_df['knowledge_state'] == 'Known'])
     avg_s = cards_df['s'].mean() if 's' in cards_df.columns else 0
 
-    # 2. XP & Gold Ledger
     total_xp = int((mature_count * 20) + (avg_s * 10))
     gross_gold = int(total_xp * 0.1)
 
-    # 3. Interest (Bonus for high stability)
     interest = int(gross_gold * 0.05) if avg_s > 21 else 0
 
-    # 4. Taxes (Penalty for 'Again' presses today)
-    today_fails = len(revlog_df[(revlog_df['review_date'] == date.today()) & (revlog_df['ease'] == 1)])
-    daily_tax = today_fails * 10
+    # --- FIXED TAX LOGIC: Only penalize actual demotions (Lapses) ---
+    if 'type' in revlog_df.columns:
+        # type == 1 means the card was in the "Review" phase.
+        # ease == 1 means you hit "Again".
+        today_demotions = len(revlog_df[
+                                  (revlog_df['review_date'] == date.today()) &
+                                  (revlog_df['ease'] == 1) &
+                                  (revlog_df['type'] == 1)
+                                  ])
+    else:
+        # Fallback just in case
+        today_demotions = 0
 
-    current_gold = max(0, (gross_gold + interest) - (db_stats.get('spent_gold', 0) + daily_tax))
+    # Tax is 10 gold per actual memory lapse
+    daily_tax = today_demotions * 10
 
-    # RETURN ALL VARIABLES TO AVOID NAMEERRORS
-    return total_xp, current_gold, gross_gold, interest, daily_tax, avg_s
+    bonus_gold = db_stats.get('bonus_gold', 0)
+    spent_gold = db_stats.get('spent_gold', 0)
+
+    # Calculate exact net worth before applying the zero-floor
+    raw_gold = (gross_gold + interest + bonus_gold) - (spent_gold + daily_tax)
+    current_gold = max(0, raw_gold)
+    tax_debt = abs(raw_gold) if raw_gold < 0 else 0
+
+    return total_xp, current_gold, gross_gold, interest, daily_tax, avg_s, bonus_gold, tax_debt
 
 
 with st.spinner("Loading & crunching Anki data..."):
@@ -199,12 +225,15 @@ unseen_cards = len(filtered_cards[filtered_cards['knowledge_state'] == 'Unseen']
 if days_left > 0:
     daily_pace = unseen_cards / days_left
     st.sidebar.metric("New Cards Per Day", f"{daily_pace:.1f}",
-                      help="Number of 'Unseen' cards you must start daily to finish the deck by your exam.")
-
+                      help="Cards you must start daily to finish the deck.")
     if daily_pace > 30:
-        st.sidebar.warning("⚠️ High Pace Required! Consider triaging your 'Unseen' cards.")
+        st.sidebar.warning("⚠️ High Pace Required! Consider triaging 'Unseen' cards.")
     else:
         st.sidebar.success("✅ Pace is manageable.")
+elif days_left == 0:
+    st.sidebar.success("🎉 IT IS EXAM DAY! Good luck!")
+else:
+    st.sidebar.info("Exam has passed. Hope you crushed it!")
 
 
 if st.sidebar.button("🔄 Clear Cache & Re-sync"):
@@ -248,8 +277,8 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Tag Analytics", "🔍 Problem Cards", "🌌 3D Map", "🎯 Readiness", "Meta Clustering", "Game"
+tab1, tab2, tab3, tab4, tab6, tab7, tab9 = st.tabs([
+    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness", "Game"
 ])
 
 # --- TAB 1: OVERVIEW ---
@@ -287,7 +316,7 @@ with tab1:
         st.plotly_chart(fig_pie, use_container_width=True)
 
     st.divider()
-    col_heat, col_create = st.columns([1, 1])
+    col_heat, col_growth, col_create = st.columns(3)
     with col_heat:
         st.subheader("Consistency Heatmap")
         if not filtered_revlog.empty:
@@ -308,14 +337,7 @@ with tab1:
             fig_heat.update_xaxes(showticklabels=False)
             st.plotly_chart(fig_heat, use_container_width=True)
 
-    with col_create:
-        st.subheader("New Cards Added Over Time")
-        if not filtered_cards.empty:
-            new_cards = filtered_cards.groupby('creation_date').size().reset_index(name='cards_added')
-            fig_create = px.line(new_cards, x='creation_date', y='cards_added', markers=True)
-            fig_create.update_traces(line_color="#8b5cf6")
-            st.plotly_chart(fig_create, use_container_width=True)
-
+    with col_growth:
         st.subheader("📈 Learning Growth")
         if not filtered_revlog.empty:
             # Calculate when each card was first seen
@@ -325,6 +347,16 @@ with tab1:
             fig_seen = px.bar(daily_new_seen, x='review_date', y='New Seen', title="New Cards Seen (First Contact)")
             fig_seen.update_traces(marker_color="#22c55e")
             st.plotly_chart(fig_seen, use_container_width=True)
+
+    with col_create:
+        st.subheader("New Cards Added Over Time")
+        if not filtered_cards.empty:
+            new_cards = filtered_cards.groupby('creation_date').size().reset_index(name='cards_added')
+            fig_create = px.line(new_cards, x='creation_date', y='cards_added', markers=True)
+            fig_create.update_traces(line_color="#8b5cf6")
+            st.plotly_chart(fig_create, use_container_width=True)
+
+
 
 
 # --- TAB 2: FUTURE WORKLOAD & DECAY ---
@@ -454,7 +486,7 @@ with tab3:
 # --- TAB 4: TAG ANALYTICS ---
 # --- TAB 4: REFINED TAG ANALYTICS ---
 with tab4:
-    st.subheader("🏷️ Subject Difficulty by Tag (Cleaned)")
+    st.subheader("🏷️ Subject Difficulty by Tag")
 
     tag_df = filtered_cards.dropna(subset=['d', 'tags']).copy()
 
@@ -514,8 +546,6 @@ with tab4:
             else:
                 st.info("No conceptual tags met the filter criteria.")
 
-# --- TAB 5: PROBLEM CARDS ---
-with tab5:
     st.subheader("Leech & High-Difficulty Cards")
     fsrs_plot_df = filtered_cards.dropna(subset=['d', 's', 'clean_text'])
     if not fsrs_plot_df.empty:
@@ -528,195 +558,349 @@ with tab5:
         st.dataframe(problem_cards, use_container_width=True, hide_index=True, height=500)
 
 
+
+
+
 # --- TAB 6: CLEANED 3D t-SNE MAP ---
 with tab6:
-    st.subheader("🌌 3D Semantic Knowledge Map")
 
-    # Define a sidebar control for "Words to Ignore"
-    st.sidebar.divider()
-    st.sidebar.header("🌌 Map Settings")
+    subtab_cards, subtab_Meta = st.tabs(["Semantic Knowledge", "Heuristic Strategy"])
 
-    # 1. Define ALL controls at the top to avoid NameErrors
-    manual_ignore = st.sidebar.text_input("Extra Words to Ignore (comma separated)", "")
-    show_labels = st.sidebar.checkbox("Show Island Labels", value=True)
-    num_clusters = st.sidebar.slider("Number of Concept Islands", 3, 15, 8)
-    custom_perplexity = st.sidebar.slider("Map Detail (Perplexity)", 5, 50, 15)
+    with subtab_cards:
+        st.markdown("""
+                This map clusters cards based on their semantic meaning (using the cleaned text of the card fronts and tags).
+                * **Color:** Difficulty (Red = Hardest, Purple = Mastered)
+                """)
 
-    map_df = filtered_cards.dropna(subset=['clean_text', 'd']).copy()
+        # Define a sidebar control for "Words to Ignore"
+        st.sidebar.divider()
+        st.sidebar.header("🌌 Map Settings")
 
-    if len(map_df) > 30:
-        with st.spinner("Purging citations and calculating t-SNE..."):
+        # 1. Define ALL controls at the top to avoid NameErrors
+        manual_ignore = st.sidebar.text_input("Extra Words to Ignore (comma separated)", "")
+        show_labels = st.sidebar.checkbox("Show Island Labels", value=True)
+        num_clusters = st.sidebar.slider("Number of Concept Islands", 3, 15, 8)
+        custom_perplexity = st.sidebar.slider("Map Detail (Perplexity)", 5, 50, 15)
 
-            # 2. Build the custom ignore list from your sidebar input
-            user_stop_words = [w.strip().lower() for w in manual_ignore.split(",") if w.strip()]
-            fixed_stop_words = ['moreau', 'payette', 'bauce', 'allen', 'rademacher', 'results', 'discussion',
-                                'background']
-            all_stops = fixed_stop_words + user_stop_words
+        map_df = filtered_cards.dropna(subset=['clean_text', 'd']).copy()
 
-
-            # 3. Scientific Purge Function
-            # 3. Scientific Purge Function (Updated to strip numbers/dates)
-            def purge_noise(text):
-                # 1. Lowercase and remove punctuation/special chars
-                text = re.sub(r'[^\w\s]', ' ', str(text).lower())
-
-                # 2. Split into tokens
-                tokens = re.split(r'[ _]', text)
-
-                clean_tokens = []
-                for t in tokens:
-                    # Ignore if the token is a number or contains digits (dates, measurements)
-                    if any(char.isdigit() for char in t):
-                        continue
-
-                    # Ignore common noise and short fragments (et, al, s2)
-                    if len(t) > 3 and t not in all_stops:
-                        clean_tokens.append(t)
-
-                return " ".join(clean_tokens)
+        if len(map_df) > 30:
+            with st.spinner("Purging citations and calculating t-SNE..."):
 
 
-            map_df['nlp_ready_text'] = map_df['clean_text'].apply(purge_noise)
-            map_df['nlp_ready_tags'] = map_df['tags'].apply(purge_noise)
-            map_df['combined_features'] = map_df['nlp_ready_text'] + " " + map_df['nlp_ready_tags']
+                all_stops = GLOBAL_STOP_WORDS
 
-            # 4. Math Pipeline
-            vectorizer = TfidfVectorizer(
-                stop_words='english',
-                max_features=1500,  # Increased to account for extra phrase tokens
-                max_df=0.4,
-                min_df=3,
-                ngram_range=(1, 3)
-            )
-            X = vectorizer.fit_transform(map_df['combined_features'])
 
-            svd = TruncatedSVD(n_components=min(50, X.shape[1] - 1), random_state=42)
-            X_reduced = svd.fit_transform(X)
+                # 3. Scientific Purge Function
+                # 3. Scientific Purge Function (Updated to strip numbers/dates)
+                def purge_noise(text):
+                    # 1. Lowercase and remove punctuation/special chars
+                    text = re.sub(r'[^\w\s]', ' ', str(text).lower())
 
-            # custom_perplexity is now safely defined at the top of the block
-            final_perp = min(custom_perplexity, len(map_df) - 1)
+                    # 2. Split into tokens
+                    tokens = re.split(r'[ _]', text)
 
-            tsne = TSNE(
-                n_components=3,
-                random_state=42,
-                perplexity=final_perp,
-                init='pca',
-                learning_rate='auto'
-            )
-            coords = tsne.fit_transform(X_reduced)
+                    clean_tokens = []
+                    for t in tokens:
+                        # Ignore if the token is a number or contains digits (dates, measurements)
+                        if any(char.isdigit() for char in t):
+                            continue
 
-            map_df['Map X'], map_df['Map Y'], map_df['Map Z'] = coords[:, 0], coords[:, 1], coords[:, 2]
+                        # Ignore common noise and short fragments (et, al, s2)
+                        if len(t) > 3 and t not in all_stops:
+                            clean_tokens.append(t)
 
-            # 5. K-Means for Island Labelling
-            kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init='auto')
-            map_df['cluster'] = kmeans.fit_predict(coords)
+                    return " ".join(clean_tokens)
 
-            cluster_labels = {}
-            if show_labels:
-                feature_names = vectorizer.get_feature_names_out()
 
-                for i in range(num_clusters):
-                    cluster_indices = map_df[map_df['cluster'] == i].index
-                    # Calculate mean TF-IDF for this cluster to find 'signature' phrases
-                    cluster_tfidf = X[map_df.index.get_indexer(cluster_indices)].mean(axis=0).A1
+                map_df['nlp_ready_text'] = map_df['clean_text'].apply(purge_noise)
+                map_df['nlp_ready_tags'] = map_df['tags'].apply(purge_noise)
+                map_df['combined_features'] = map_df['nlp_ready_text'] + " " + map_df['nlp_ready_tags']
 
-                    # Sort by highest score
-                    top_indices = cluster_tfidf.argsort()[::-1]
+                # 4. Math Pipeline
+                vectorizer = TfidfVectorizer(
+                    stop_words='english',
+                    max_features=1500,  # Increased to account for extra phrase tokens
+                    max_df=0.4,
+                    min_df=3,
+                    ngram_range=(1, 3)
+                )
+                X = vectorizer.fit_transform(map_df['combined_features'])
 
-                    # Logic: Prioritize the highest scoring n-gram that isn't noise
-                    best_label = f"Cluster {i}"
-                    for idx in top_indices:
-                        candidate = feature_names[idx]
-                        # Ensure the label isn't just a citation or one of your stop words
-                        if not any(stop in candidate for stop in all_stops):
-                            best_label = candidate.upper()
-                            break
-                    cluster_labels[i] = best_label
+                svd = TruncatedSVD(n_components=min(50, X.shape[1] - 1), random_state=42)
+                X_reduced = svd.fit_transform(X)
 
-            # 6. Final 3D Plot
-            fig_map = px.scatter_3d(
-                map_df, x='Map X', y='Map Y', z='Map Z',
-                color='d', color_continuous_scale='Turbo',
-                hover_name='deck_name',
-                hover_data={'Map X': False, 'Map Y': False, 'Map Z': False, 'clean_text': True, 'd': True},
-                opacity=0.7, height=800
-            )
+                # custom_perplexity is now safely defined at the top of the block
+                final_perp = min(custom_perplexity, len(map_df) - 1)
 
-            if show_labels:
-                centers = map_df.groupby('cluster')[['Map X', 'Map Y', 'Map Z']].mean().reset_index()
-                for _, row in centers.iterrows():
-                    label = cluster_labels.get(row['cluster'], "")
-                    fig_map.add_trace(go.Scatter3d(
-                        x=[row['Map X']], y=[row['Map Y']], z=[row['Map Z']],
-                        mode='text',
-                        text=[f"<b>{label}</b>"],
-                        textfont=dict(color='white', size=14),
-                        showlegend=False,
-                        hoverinfo='none'
+                tsne = TSNE(
+                    n_components=3,
+                    random_state=42,
+                    perplexity=final_perp,
+                    init='pca',
+                    learning_rate='auto'
+                )
+                coords = tsne.fit_transform(X_reduced)
+
+                map_df['Map X'], map_df['Map Y'], map_df['Map Z'] = coords[:, 0], coords[:, 1], coords[:, 2]
+
+                # 5. K-Means for Island Labelling
+                kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init='auto')
+                map_df['cluster'] = kmeans.fit_predict(coords)
+
+                cluster_labels = {}
+                if show_labels:
+                    feature_names = vectorizer.get_feature_names_out()
+
+                    for i in range(num_clusters):
+                        cluster_indices = map_df[map_df['cluster'] == i].index
+                        # Calculate mean TF-IDF for this cluster to find 'signature' phrases
+                        cluster_tfidf = X[map_df.index.get_indexer(cluster_indices)].mean(axis=0).A1
+
+                        # Sort by highest score
+                        top_indices = cluster_tfidf.argsort()[::-1]
+
+                        # Logic: Prioritize the highest scoring n-gram that isn't noise
+                        best_label = f"Cluster {i}"
+                        for idx in top_indices:
+                            candidate = feature_names[idx]
+                            # Ensure the label isn't just a citation or one of your stop words
+                            if not any(stop in candidate for stop in all_stops):
+                                best_label = candidate.upper()
+                                break
+                        cluster_labels[i] = best_label
+
+                # 6. Final 3D Plot
+                fig_map = px.scatter_3d(
+                    map_df, x='Map X', y='Map Y', z='Map Z',
+                    color='d', color_continuous_scale='Turbo',
+                    hover_name='deck_name',
+                    hover_data={'Map X': False, 'Map Y': False, 'Map Z': False, 'clean_text': True, 'd': True},
+                    opacity=0.7, height=800
+                )
+
+                if show_labels:
+                    centers = map_df.groupby('cluster')[['Map X', 'Map Y', 'Map Z']].mean().reset_index()
+                    for _, row in centers.iterrows():
+                        label = cluster_labels.get(row['cluster'], "")
+                        fig_map.add_trace(go.Scatter3d(
+                            x=[row['Map X']], y=[row['Map Y']], z=[row['Map Z']],
+                            mode='text',
+                            text=[f"<b>{label}</b>"],
+                            textfont=dict(color='white', size=14),
+                            showlegend=False,
+                            hoverinfo='none'
+                        ))
+
+                fig_map.update_traces(marker=dict(size=4))
+                fig_map.update_layout(scene=dict(
+                    xaxis=dict(showbackground=False, showticklabels=False, title=''),
+                    yaxis=dict(showbackground=False, showticklabels=False, title=''),
+                    zaxis=dict(showbackground=False, showticklabels=False, title='')
+                ))
+                st.plotly_chart(fig_map, use_container_width=True)
+        else:
+            st.info("You need at least 30 cards to generate this map.")
+
+    with subtab_Meta:
+        st.markdown("""
+        This map synthesizes every data point Anki and FSRS have on your learning behavior.
+        * **Vertical Position (Z):** Stability (Memory Depth) — Higher is better!
+        * **Color:** Difficulty (Red = Hardest, Green = Mastered)
+        * **Size:** Lapses (Conceptual friction/failures)
+        * **Text Labels:** Automated "signature concept" for high-risk cards
+        """)
+
+        # 1. Define Heuristics and filter for available data
+        base_heuristics = ['d', 's', 'ivl', 'lapses', 'reps', 'r']
+        available_h = [h for h in base_heuristics if h in filtered_cards.columns]
+
+        # Create a copy focused on cards with core FSRS data
+        strat_df = filtered_cards.dropna(subset=['d', 's']).copy()
+
+        if len(strat_df) > 15:
+            with st.spinner("Crunching behavioral heuristics and semantic labels..."):
+
+                # 2. Impute missing values with medians for robustness
+                for h in available_h:
+                    median_val = strat_df[h].median()
+                    if pd.isna(median_val):
+                        # Use mathematical defaults if a column is totally empty
+                        default = 0.9 if h == 'r' else 0
+                        strat_df[h] = strat_df[h].fillna(default)
+                    else:
+                        strat_df[h] = strat_df[h].fillna(median_val)
+
+                # 3. Final safety cleanup
+                final_df = strat_df.dropna(subset=available_h).copy()
+
+                if len(final_df) > 10:
+                    from sklearn.preprocessing import StandardScaler
+
+                    scaler = StandardScaler()
+                    strat_scaled = scaler.fit_transform(final_df[available_h])
+
+                    # 4. 3D t-SNE Projection (PCA Init for stability)
+                    tsne_all = TSNE(
+                        n_components=3,
+                        perplexity=min(30, len(final_df) - 1),
+                        random_state=42,
+                        init='pca',
+                        learning_rate='auto'
+                    )
+                    strat_coords = tsne_all.fit_transform(strat_scaled)
+                    final_df['HX'], final_df['HY'], final_df['HZ'] = strat_coords[:, 0], strat_coords[:,
+                                                                                         1], strat_coords[:,
+                                                                                             2]
+
+                    # 5. K-Means Behavioral Clustering
+                    n_meta_clusters = min(5, len(final_df))
+                    km_meta = KMeans(n_clusters=n_meta_clusters, random_state=42, n_init='auto')
+                    final_df['meta_cluster'] = km_meta.fit_predict(strat_scaled)
+
+                    # 6. Strategic Labeling based on behavioral patterns
+                    centers = final_df.groupby('meta_cluster')[available_h].mean()
+                    meta_labels = {}
+                    avg_lapses = final_df['lapses'].mean()
+
+                    for i, row in centers.iterrows():
+                        if row.get('lapses', 0) > avg_lapses * 1.5:
+                            meta_labels[i] = "🛑 THE LEECH PIT"
+                        elif row['d'] > 7.5 and row['s'] < 10:
+                            meta_labels[i] = "⚠️ HIGH-FRICTION ZONE"
+                        elif row['s'] > 45:
+                            meta_labels[i] = "💎 LONG-TERM ASSETS"
+                        elif row.get('r', 1) < 0.88:
+                            meta_labels[i] = "📉 URGENT DECAY"
+                        else:
+                            meta_labels[i] = "⚡ STEADY PROGRESS"
+
+                    final_df['Behavioral_Group'] = final_df['meta_cluster'].map(meta_labels)
+
+
+                    # 7. Semantic Label Extraction per point
+                    def get_point_concept(text, tags):
+                        raw = f"{text} {tags}"
+                        # Use a regex to strip numbers and dates
+                        text_no_nums = re.sub(r'\d+', '', str(raw).lower())
+                        tokens = re.split(r'[ _]', re.sub(r'[^\w\s]', ' ', text_no_nums))
+                        clean = [t for t in tokens if len(t) > 3 and t not in all_stops]
+                        return max(clean, key=len).upper() if clean else "MISC"
+
+
+                    final_df['Concept'] = final_df.apply(lambda x: get_point_concept(x['clean_text'], x['tags']),
+                                                         axis=1)
+
+                    # 8. The 3D Strategy Plot
+                    fig_all = px.scatter_3d(
+                        final_df, x='HX', y='HY', z='s',
+                        color='d', size='lapses',
+                        symbol='Behavioral_Group',
+                        hover_name='Concept',
+                        hover_data={
+                            'clean_text': True,
+                            'deck_name':  True,
+                            'd':          True,
+                            's':          ':.1f',
+                            'lapses':     True,
+                            'HX':         False, 'HY': False
+                        },
+                        opacity=0.8, height=850,
+                        color_continuous_scale='RdYlGn_r'
+                    )
+
+                    # Overlay text labels for 'Danger' clusters to highlight friction
+                    danger_groups = ["🛑 THE LEECH PIT", "⚠️ HIGH-FRICTION ZONE"]
+                    danger_df = final_df[final_df['Behavioral_Group'].isin(danger_groups)]
+                    if not danger_df.empty:
+                        fig_all.add_trace(go.Scatter3d(
+                            x=danger_df['HX'], y=danger_df['HY'], z=danger_df['s'],
+                            mode='text',
+                            text=danger_df['Concept'],
+                            textfont=dict(size=10, color="white"),
+                            showlegend=False
+                        ))
+
+                    fig_all.update_layout(scene=dict(
+                        xaxis=dict(showticklabels=False, title='Behavioral Context X'),
+                        yaxis=dict(showticklabels=False, title='Behavioral Context Y'),
+                        zaxis_title='Memory Stability (Days)'
                     ))
+                    st.plotly_chart(fig_all, use_container_width=True)
 
-            fig_map.update_traces(marker=dict(size=4))
-            fig_map.update_layout(scene=dict(
-                xaxis=dict(showbackground=False, showticklabels=False, title=''),
-                yaxis=dict(showbackground=False, showticklabels=False, title=''),
-                zaxis=dict(showbackground=False, showticklabels=False, title='')
-            ))
-            st.plotly_chart(fig_map, use_container_width=True)
-    else:
-        st.info("You need at least 30 cards to generate this map.")
+                    # 9. Cluster Statistics Summary
+                    st.subheader("📋 Behavioral Performance Summary")
+                    readable_centers = centers.copy()
+                    readable_centers.index = [meta_labels.get(i, f"Group {i}") for i in readable_centers.index]
+                    st.dataframe(readable_centers.sort_values('d', ascending=False), use_container_width=True)
 
+                else:
+                    st.warning("Not enough clean data left for this operation.")
+        else:
+            st.info("Insufficient FSRS history to generate this map. Keep reviewing!")
+
+
+# --- TAB 7: MASTER READINESS & CALIBRATION ---
 # --- TAB 7: MASTER READINESS & CALIBRATION ---
 with tab7:
     st.subheader("🎯 Master Readiness & FSRS Calibration")
 
     col_gauge, col_stab = st.columns([1, 2])
 
-    # 1. Calculate RMSE (Simplified Proxy)
-    # FSRS RMSE is the diff between predicted Retrievability (r) and actual outcome
-    if not filtered_revlog.empty and 'r' in filtered_cards.columns:
-        # We look at recently reviewed cards that have FSRS retrievability data
-        calib_df = filtered_cards.dropna(subset=['r', 'last_review_datetime'])
+    if not filtered_revlog.empty:
+        # 1. Calculate Actual Retention (for the caption)
+        actual_passed = (filtered_revlog['ease'] > 1).sum()
+        actual_total = len(filtered_revlog)
+        actual_retention = (actual_passed / actual_total) * 100 if actual_total > 0 else 0
 
-        # Simple RMSE calculation: sqrt(mean((Actual - Predicted)^2))
-        # For a truly live gauge, we use the average deviation of stability
-        actual_retention = (filtered_revlog['ease'] > 1).mean()
-        target_retention = 0.90  # Default Anki target
-        rmse_score = abs(actual_retention - target_retention) * 100
+        # 2. Calculate RMSE (for the gauge)
+        # We focus on Review cards (type 1) for the most accurate calibration check
+        review_logs = filtered_revlog[filtered_revlog['type'] == 1]
+
+        if not review_logs.empty:
+            outcomes = (review_logs['ease'] > 1).astype(int)
+            mse = ((outcomes - 0.9) ** 2).mean()  # Compares against 90% target
+            rmse_score = (mse ** 0.5) * 100
+        else:
+            # If no reviews yet, use a simple drift calculation from all cards
+            rmse_score = abs(actual_retention - 90.0)
 
         with col_gauge:
             fig_gauge = go.Figure(go.Indicator(
                 mode="gauge+number",
                 value=rmse_score,
                 domain={'x': [0, 1], 'y': [0, 1]},
-                title={'text': "FSRS Calibration Error (RMSE %)", 'font': {'size': 18}},
+                title={'text': "FSRS Calibration RMSE (%)", 'font': {'size': 18}},
                 gauge={
-                    'axis':        {'range': [0, 20], 'tickwidth': 1},
-                    'bar':         {'color': "#60a5fa"},
-                    'bgcolor':     "white",
-                    'borderwidth': 2,
-                    'bordercolor': "gray",
-                    'steps':       [
-                        {'range': [0, 5], 'color': '#22c55e'},  # Green: Excellent
-                        {'range': [5, 10], 'color': '#facc15'},  # Yellow: Fair
-                        {'range': [10, 20], 'color': '#ef4444'}  # Red: Needs Optimization
+                    'axis':    {'range': [0, 100], 'tickwidth': 1},
+                    'bar':     {'color': "#60a5fa"},
+                    'bgcolor': "white",
+                    'steps':   [
+                        {'range': [0, 10], 'color': '#22c55e'},  # Healthy
+                        {'range': [10, 30], 'color': '#facc15'},  # Drifting
+                        {'range': [30, 100], 'color': '#ef4444'}  # Miscalibrated
                     ],
                 }
             ))
-            fig_gauge.update_layout(height=400, margin=dict(t=50, b=20))
+            fig_gauge.update_layout(height=350, margin=dict(t=50, b=20, l=20, r=20))
             st.plotly_chart(fig_gauge, use_container_width=True)
 
-            st.caption(f"**Current True Retention:** {actual_retention * 100:.1f}%")
-            st.caption(f"Target is 90%. Lower RMSE means better scheduling.")
+            # Now actual_retention is definitely defined!
+            st.caption(f"**Current True Retention:** {actual_retention:.1f}%")
+            st.caption("Target is 90%. Lower RMSE means your FSRS parameters perfectly match your memory.")
 
         with col_stab:
+            # Stability Distribution
             st.markdown(f"**Average Memory Stability:** {filtered_cards['s'].mean():.1f} days")
             fig_stab = px.histogram(
                 filtered_cards, x='s', nbins=50,
                 title="Knowledge Depth (Stability Distribution)",
                 color_discrete_sequence=['#60a5fa']
             )
-            fig_stab.update_layout(xaxis_title="Days until Forgotten", yaxis_title="Number of Cards", height=400)
+            fig_stab.update_layout(xaxis_title="Days until Forgotten", yaxis_title="Number of Cards", height=350)
             st.plotly_chart(fig_stab, use_container_width=True)
+    else:
+        st.info("The Oracle needs review history to calibrate the FSRS model.")
 
     # 2. Existing Sunburst Super-Cluster
     st.divider()
@@ -760,254 +944,321 @@ with tab7:
         st.plotly_chart(fig_cluster, use_container_width=True)
 
 
-# --- TAB 8: ROBUST ALL-HEURISTIC STRATEGIC MAP ---
-# --- TAB 8: ROBUST ALL-HEURISTIC STRATEGIC MAP (WITH SEMANTIC LABELS) ---
-with tab8:
-    st.subheader("🌌 The All-Heuristic Strategy Galaxy")
-    st.markdown("""
-    This map synthesizes every data point Anki and FSRS have on your learning behavior.
-    * **Vertical Position (Z):** Stability (Memory Depth) — Higher is better!
-    * **Color:** Difficulty (Red = Hardest, Green = Mastered)
-    * **Size:** Lapses (Conceptual friction/failures)
-    * **Text Labels:** Automated "signature concept" for high-risk cards
-    """)
 
-    # 1. Define Heuristics and filter for available data
-    base_heuristics = ['d', 's', 'ivl', 'lapses', 'reps', 'r']
-    available_h = [h for h in base_heuristics if h in filtered_cards.columns]
+# --- TAB 9: THE ADVENTURER'S GUILD & ARMORY ---
+import random
 
-    # Create a copy focused on cards with core FSRS data
-    strat_df = filtered_cards.dropna(subset=['d', 's']).copy()
-
-    if len(strat_df) > 15:
-        with st.spinner("Crunching behavioral heuristics and semantic labels..."):
-
-            # 2. Impute missing values with medians for robustness
-            for h in available_h:
-                median_val = strat_df[h].median()
-                if pd.isna(median_val):
-                    # Use mathematical defaults if a column is totally empty
-                    default = 0.9 if h == 'r' else 0
-                    strat_df[h] = strat_df[h].fillna(default)
-                else:
-                    strat_df[h] = strat_df[h].fillna(median_val)
-
-            # 3. Final safety cleanup
-            final_df = strat_df.dropna(subset=available_h).copy()
-
-            if len(final_df) > 10:
-                from sklearn.preprocessing import StandardScaler
-
-                scaler = StandardScaler()
-                strat_scaled = scaler.fit_transform(final_df[available_h])
-
-                # 4. 3D t-SNE Projection (PCA Init for stability)
-                tsne_all = TSNE(
-                    n_components=3,
-                    perplexity=min(30, len(final_df) - 1),
-                    random_state=42,
-                    init='pca',
-                    learning_rate='auto'
-                )
-                strat_coords = tsne_all.fit_transform(strat_scaled)
-                final_df['HX'], final_df['HY'], final_df['HZ'] = strat_coords[:, 0], strat_coords[:, 1], strat_coords[:,
-                                                                                                         2]
-
-                # 5. K-Means Behavioral Clustering
-                n_meta_clusters = min(5, len(final_df))
-                km_meta = KMeans(n_clusters=n_meta_clusters, random_state=42, n_init='auto')
-                final_df['meta_cluster'] = km_meta.fit_predict(strat_scaled)
-
-                # 6. Strategic Labeling based on behavioral patterns
-                centers = final_df.groupby('meta_cluster')[available_h].mean()
-                meta_labels = {}
-                avg_lapses = final_df['lapses'].mean()
-
-                for i, row in centers.iterrows():
-                    if row.get('lapses', 0) > avg_lapses * 1.5:
-                        meta_labels[i] = "🛑 THE LEECH PIT"
-                    elif row['d'] > 7.5 and row['s'] < 10:
-                        meta_labels[i] = "⚠️ HIGH-FRICTION ZONE"
-                    elif row['s'] > 45:
-                        meta_labels[i] = "💎 LONG-TERM ASSETS"
-                    elif row.get('r', 1) < 0.88:
-                        meta_labels[i] = "📉 URGENT DECAY"
-                    else:
-                        meta_labels[i] = "⚡ STEADY PROGRESS"
-
-                final_df['Behavioral_Group'] = final_df['meta_cluster'].map(meta_labels)
-
-
-                # 7. Semantic Label Extraction per point
-                def get_point_concept(text, tags):
-                    raw = f"{text} {tags}"
-                    # Use a regex to strip numbers and dates
-                    text_no_nums = re.sub(r'\d+', '', str(raw).lower())
-                    tokens = re.split(r'[ _]', re.sub(r'[^\w\s]', ' ', text_no_nums))
-                    clean = [t for t in tokens if len(t) > 3 and t not in all_stops]
-                    return max(clean, key=len).upper() if clean else "MISC"
-
-
-                final_df['Concept'] = final_df.apply(lambda x: get_point_concept(x['clean_text'], x['tags']), axis=1)
-
-                # 8. The 3D Strategy Plot
-                fig_all = px.scatter_3d(
-                    final_df, x='HX', y='HY', z='s',
-                    color='d', size='lapses',
-                    symbol='Behavioral_Group',
-                    hover_name='Concept',
-                    hover_data={
-                        'clean_text': True,
-                        'deck_name':  True,
-                        'd':          True,
-                        's':          ':.1f',
-                        'lapses':     True,
-                        'HX':         False, 'HY': False
-                    },
-                    opacity=0.8, height=850,
-                    color_continuous_scale='RdYlGn_r'
-                )
-
-                # Overlay text labels for 'Danger' clusters to highlight friction
-                danger_groups = ["🛑 THE LEECH PIT", "⚠️ HIGH-FRICTION ZONE"]
-                danger_df = final_df[final_df['Behavioral_Group'].isin(danger_groups)]
-                if not danger_df.empty:
-                    fig_all.add_trace(go.Scatter3d(
-                        x=danger_df['HX'], y=danger_df['HY'], z=danger_df['s'],
-                        mode='text',
-                        text=danger_df['Concept'],
-                        textfont=dict(size=10, color="white"),
-                        showlegend=False
-                    ))
-
-                fig_all.update_layout(scene=dict(
-                    xaxis=dict(showticklabels=False, title='Behavioral Context X'),
-                    yaxis=dict(showticklabels=False, title='Behavioral Context Y'),
-                    zaxis_title='Memory Stability (Days)'
-                ))
-                st.plotly_chart(fig_all, use_container_width=True)
-
-                # 9. Cluster Statistics Summary
-                st.subheader("📋 Behavioral Performance Summary")
-                readable_centers = centers.copy()
-                readable_centers.index = [meta_labels.get(i, f"Group {i}") for i in readable_centers.index]
-                st.dataframe(readable_centers.sort_values('d', ascending=False), use_container_width=True)
-
-            else:
-                st.warning("Not enough clean data left for this operation.")
-    else:
-        st.info("Insufficient FSRS history to generate this map. Keep reviewing!")
-
-# --- TAB 9: THE ADVENTURER'S GUILD (SKILLS, TAXES & INTEREST) ---
-
-# --- TAB 9: THE ADVENTURER'S GUILD (XP, BOSSES & SKILLS) ---
 with tab9:
-    # 1. THE CALCULATION ENGINE (Unpack everything here to avoid NameErrors)
-    db_stats = get_user_stats()
+    # 1. OPTIMISTIC UI STATE BUFFER
+    # Only pull from Supabase if we haven't loaded the stats into this session yet
+    if 'db_stats' not in st.session_state:
+        fetched_stats = get_user_stats()
+        # Fallback dictionary if the database row is completely empty
+        if not fetched_stats:
+            fetched_stats = {"spent_gold": 0, "bonus_gold": 0, "inventory": {}, "claimed_bounties": {}}
+        st.session_state['db_stats'] = fetched_stats
 
-    # Run the RPG state logic (Assumes calculate_rpg_state is defined as per our previous turn)
-    total_xp, current_gold, gross_gold, interest, daily_tax, avg_s = calculate_rpg_state(
+    db_stats = st.session_state['db_stats']
+
+    # Safely initialize keys to prevent KeyError crashes
+    if 'bonus_gold' not in db_stats:
+        db_stats['bonus_gold'] = 0
+    if 'spent_gold' not in db_stats:
+        db_stats['spent_gold'] = 0
+    if 'claimed_bounties' not in db_stats:
+        db_stats['claimed_bounties'] = {}
+    if 'inventory' not in db_stats:
+        db_stats['inventory'] = {'display_case': []}
+
+    inventory = db_stats['inventory']
+    display_case = inventory.get('display_case', [])
+
+    # Run Calculation Engine with the new tax_debt variable
+    total_xp, current_gold, gross_gold, interest, daily_tax, avg_s, bonus_gold, tax_debt = calculate_rpg_state(
         filtered_cards, filtered_revlog, db_stats
     )
 
-    # Derive Levels and Skills
     user_level = int((total_xp / 150) ** 0.5) + 1
     fortitude_lvl = int(avg_s / 5)
-
     retention = (filtered_revlog['ease'] > 1).mean() * 100 if not filtered_revlog.empty else 0
     precision_lvl = int(retention / 10)
-
     avg_time = filtered_revlog['time'].mean() / 1000 if not filtered_revlog.empty else 0
     celerity_lvl = int(max(0, 100 - (avg_time * 5)) / 10)
-
     seen_cards = len(filtered_cards[filtered_cards['knowledge_state'] != 'Unseen'])
     total_cards = len(filtered_cards)
     cart_lvl = int((seen_cards / total_cards) * 10) if total_cards > 0 else 0
 
-    # 2. XP PROGRESSION BAR
-    st.header(f"🛡️ Rank {user_level} Scholar")
+    subtab_guild, subtab_armory = st.tabs(["⚔️ Guild Hall (Quests)", "🏛️ The Armory (Shop)"])
 
-    xp_for_current = (user_level - 1) ** 2 * 150
-    xp_for_next = user_level ** 2 * 150
-    # Prevent division by zero and ensure range 0.0 - 1.0
-    denom = (xp_for_next - xp_for_current)
-    lvl_progress = (total_xp - xp_for_current) / denom if denom > 0 else 0
+    # ==========================================
+    # SUB-TAB 1: GUILD HALL
+    # ==========================================
+    with subtab_guild:
+        with st.container(border=True):
+            st.header(f"🛡️ Scholar Level {user_level}")
 
-    st.progress(min(max(lvl_progress, 0.0), 1.0),
-                text=f"✨ {total_xp - xp_for_current} / {denom} XP to Level {user_level + 1}")
+            xp_for_current = (user_level - 1) ** 2 * 150
+            xp_for_next = user_level ** 2 * 150
+            denom = (xp_for_next - xp_for_current)
+            lvl_progress = (total_xp - xp_for_current) / denom if denom > 0 else 0
+            st.progress(min(max(lvl_progress, 0.0), 1.0),
+                        text=f"✨ {total_xp - xp_for_current} / {denom} XP to Level {user_level + 1}")
 
-    col_v1, col_v2, col_v3 = st.columns(3)
-    col_v1.metric("Gold Balance", f"💰 {current_gold}")
-    col_v2.metric("Gross Gold", f"🪙 {gross_gold}")
-    col_v3.metric("Daily Interest", f"📈 +{interest}")
+            col_radar, col_treasury = st.columns([2, 1])
 
-    st.divider()
+            with col_radar:
+                radar_data = pd.DataFrame(dict(
+                    r=[fortitude_lvl, precision_lvl, celerity_lvl, cart_lvl, fortitude_lvl],
+                    theta=['Fortitude', 'Precision', 'Celerity', 'Cartography', 'Fortitude']
+                ))
+                fig_radar = px.line_polar(radar_data, r='r', theta='theta', line_close=True)
+                fig_radar.update_traces(fill='toself', line_color='#8b5cf6')
+                fig_radar.update_layout(height=280, margin=dict(t=20, b=20, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig_radar, use_container_width=True)
 
-    # 3. DYNAMIC DAILY BOUNTIES
-    st.subheader("📜 Dynamic Daily Bounties")
+                with col_treasury:
+                    st.markdown("### 🏛️ Treasury")
+                    st.metric("Current Gold Balance", f"💰 {current_gold}")
+                    st.caption(f"**Gross XP Gold:** 🪙 {gross_gold}")
+                    st.caption(f"**Quest Bonus Gold:** 💰 {bonus_gold}")
+                    st.caption(f"**Daily Interest:** 📈 +{interest}")
+                    if tax_debt > 0:
+                        st.error(f"⚠️ **Tax Debt:** -{tax_debt} Gold (Clear by earning XP!)")
 
-    # Calculate goals based on actual deck state
-    cards_due_today = len(filtered_cards[filtered_cards['s'] < 1])
-    unseen_remaining = total_cards - seen_cards
+            # --- THE BOUNTY BOARD (INSTANT PAYOUTS) ---
+            with st.container(border=True):
+                st.subheader("📜 Daily Bounty Board")
 
-    scribe_goal = max(20, min(100, cards_due_today))
-    explorer_goal = max(5, min(25, int(unseen_remaining * 0.05)))
+                today_str = str(date.today())
+                bounties = db_stats['claimed_bounties']
 
-    today_revs = filtered_revlog[filtered_revlog['review_date'] == date.today()]
-    today_count = len(today_revs)
-    today_new = len(filtered_cards[filtered_cards['creation_date'] == date.today()])
+                if bounties.get('date') != today_str:
+                    bounties = {"date": today_str, "q1": False, "q2": False, "q3": False}
+                    db_stats['claimed_bounties'] = bounties
 
-    q1, q2, q3 = st.columns(3)
-    with q1:
-        st.write(f"**The Scribe** ({scribe_goal} Reviews)")
-        st.progress(min(1.0, today_count / scribe_goal) if scribe_goal > 0 else 1.0)
-        if today_count >= scribe_goal:
-            st.success("💰 +20 Gold")
+                cards_due_today = len(filtered_cards[filtered_cards['s'] < 1])
+                unseen_remaining = total_cards - seen_cards
 
-    with q2:
-        st.write(f"**The Explorer** ({explorer_goal} New)")
-        st.progress(min(1.0, today_new / explorer_goal) if explorer_goal > 0 else 1.0)
-        if today_new >= explorer_goal:
-            st.success("💰 +30 Gold")
+                scribe_goal = max(20, min(100, cards_due_today))
+                explorer_goal = max(5, min(25, int(unseen_remaining * 0.05)))
 
-    with q3:
-        st.write("**The Perfectionist** (90% Acc)")
-        today_acc = (today_revs['ease'] > 1).mean() * 100 if today_count > 0 else 0
-        st.progress(min(1.0, today_acc / 90))
-        if today_acc >= 90 and today_count >= 10:
-            st.success("💰 +50 Gold")
+                today_revs = filtered_revlog[filtered_revlog['review_date'] == date.today()]
+                today_count = len(today_revs)
+                today_new = len(filtered_cards[filtered_cards['creation_date'] == date.today()])
 
-    st.divider()
 
-    # 4. BOSS ENCOUNTERS (Semantic Instability)
-    st.subheader("👺 Active Bosses")
+                # OPTIMISTIC UPDATE FUNCTION
+                def claim_bounty(q_key, reward):
+                    # 1. Update Session State (Instant UI)
+                    db_stats['claimed_bounties'][q_key] = True
+                    db_stats['bonus_gold'] += reward
+                    st.session_state['db_stats'] = db_stats
 
-    if 'cluster' in filtered_cards.columns:
-        # Identify 'Fragile' semantic clusters
-        cluster_stats = filtered_cards.groupby('cluster').agg(
-            avg_stability=('s', 'mean'),
-            count=('id', 'count')
-        )
-        bosses = cluster_stats[(cluster_stats['avg_stability'] < 3) & (cluster_stats['count'] > 10)]
+                    # 2. Sync to Database
+                    update_user_stats({
+                        "claimed_bounties": db_stats['claimed_bounties'],
+                        "bonus_gold":       db_stats['bonus_gold']
+                    })
 
-        if not bosses.empty:
-            target_id = bosses.index[0]
-            st.error(f"⚠️ **BOSS SPAWNED: Cluster {target_id} is Fading!**")
-            if st.button("⚔️ Challenge Boss", key="btn_boss"):
-                boss_cards = filtered_cards[filtered_cards['cluster'] == target_id]
-                st.dataframe(boss_cards[['clean_text', 'd', 's']].sort_values('d', ascending=False))
+                    st.toast(f"Claimed {reward} Gold!", icon="💰")
+                    st.rerun()
+
+
+            q1, q2, q3 = st.columns(3)
+            with q1:
+                st.info(f"**The Scribe**\n\nComplete {scribe_goal} Reviews")
+                st.progress(min(1.0, today_count / scribe_goal) if scribe_goal > 0 else 1.0)
+                if bounties.get('q1'):
+                    st.success("✅ Claimed")
+                elif today_count >= scribe_goal:
+                    if st.button("Claim 💰 20", key="btn_q1"):
+                        claim_bounty("q1", 20)
+                else:
+                    st.write(f"{today_count} / {scribe_goal}")
+
+            with q2:
+                st.info(f"**The Explorer**\n\nSee {explorer_goal} New Cards")
+                st.progress(min(1.0, today_new / explorer_goal) if explorer_goal > 0 else 1.0)
+                if bounties.get('q2'):
+                    st.success("✅ Claimed")
+                elif today_new >= explorer_goal:
+                    if st.button("Claim 💰 30", key="btn_q2"):
+                        claim_bounty("q2", 30)
+                else:
+                    st.write(f"{today_new} / {explorer_goal}")
+
+            with q3:
+                st.info(f"**The Perfectionist**\n\nMaintain 90% Accuracy")
+                today_acc = (today_revs['ease'] > 1).mean() * 100 if today_count > 0 else 0
+                st.progress(min(1.0, today_acc / 90))
+                if bounties.get('q3'):
+                    st.success("✅ Claimed")
+                elif today_acc >= 90 and today_count >= 10:
+                    if st.button("Claim 💰 50", key="btn_q3"):
+                        claim_bounty("q3", 50)
+                else:
+                    st.write(f"{today_acc:.1f}% / 90.0%")
+
+        # --- THE DUNGEON ---
+        with st.container(border=True):
+            st.subheader("👺 The Dungeon: Active Threats")
+            fragile_cards = filtered_cards[filtered_cards['s'] < 3]
+
+            if not fragile_cards.empty and 'deck_name' in fragile_cards.columns:
+                boss_stats = fragile_cards.groupby('deck_name').agg(
+                    avg_stability=('s', 'mean'),
+                    count=('id', 'count'),
+                    total_difficulty=('d', 'sum')
+                )
+                bosses = boss_stats[boss_stats['count'] > 10].sort_values('avg_stability')
+
+                if not bosses.empty:
+                    target_deck = bosses.index[0]
+                    boss_data = bosses.loc[target_deck]
+                    boss_hp = int(boss_data['total_difficulty'] * 10)
+                    display_name = str(target_deck).split(' ➔ ')[-1].upper()
+
+                    col_b1, col_b2 = st.columns([1, 2])
+                    with col_b1:
+                        st.error(f"⚠️ **BOSS SPAWNED**\n\n**{display_name} Guardian**")
+                        st.metric("Boss HP (Friction)", f"🩸 {boss_hp}")
+                    with col_b2:
+                        if st.button("⚔️ Generate Slay-List", key="btn_boss", use_container_width=True):
+                            boss_cards = filtered_cards[
+                                (filtered_cards['deck_name'] == target_deck) & (filtered_cards['s'] < 3)]
+                            st.dataframe(boss_cards[['clean_text', 'd', 's']].sort_values('d', ascending=False),
+                                         height=200)
+                            st.info(
+                                f"💡 **Strategy:** Search `\"deck:{target_deck}\" prop:s<3` in Anki and review them!")
+                else:
+                    st.success("✨ The dungeon is clear.")
+            else:
+                st.success("✨ The dungeon is clear.")
+
+    # ==========================================
+    # SUB-TAB 2: THE ARMORY (DAILY SHOP)
+    # ==========================================
+    with subtab_armory:
+        today_seed = date.today().toordinal()
+        random.seed(today_seed)
+
+
+        def get_top_concept_words(df_subset, n=15):
+            if df_subset.empty:
+                return []
+            text = " ".join(df_subset['clean_text'].dropna().astype(str).tolist()).lower()
+            text = re.sub(r'[^a-z\s]', '', text)
+            words = text.split()
+            stops = GLOBAL_STOP_WORDS
+            clean_words = [w for w in words if len(w) > 4 and w not in stops]
+            if not clean_words:
+                return []
+            return pd.Series(clean_words).value_counts().head(n).index.tolist()
+
+
+        weapon_pool = get_top_concept_words(filtered_cards[filtered_cards['d'] < 4])
+        armor_pool = get_top_concept_words(filtered_cards[filtered_cards['s'] > 21])
+        relic_pool = get_top_concept_words(
+            filtered_cards[filtered_cards['knowledge_state'].isin(['Unseen', 'Learning'])])
+
+        w_concept = random.choice(weapon_pool).capitalize() if weapon_pool else "Iron"
+        a_concept = random.choice(armor_pool).capitalize() if armor_pool else "Leather"
+        r_concept = random.choice(relic_pool).capitalize() if relic_pool else "Novice"
+
+        if celerity_lvl > precision_lvl:
+            weapon_item = f"🗡️ The {w_concept} Scalpel"
+        elif precision_lvl > 7:
+            weapon_item = f"🏹 {w_concept} Longbow"
         else:
-            st.success("The semantic horizon is clear. No bosses detected.")
+            weapon_item = f"📖 {w_concept} Grimoire"
 
-    st.divider()
+        if fortitude_lvl >= 10:
+            armor_item = f"🛡️ {a_concept} Carapace"
+        elif fortitude_lvl >= 5:
+            armor_item = f"🧥 {a_concept} Mantle"
+        else:
+            armor_item = f"👕 {a_concept} Tunic"
 
-    # 5. CHARACTER ATTRIBUTES (SPIDER GRAPH)
-    st.subheader("⚔️ Character Attributes")
-    radar_data = pd.DataFrame(dict(
-        r=[fortitude_lvl, precision_lvl, celerity_lvl, cart_lvl, fortitude_lvl],
-        theta=['Fortitude', 'Precision', 'Celerity', 'Cartography', 'Fortitude']
-    ))
-    fig_radar = px.line_polar(radar_data, r='r', theta='theta', line_close=True)
-    fig_radar.update_traces(fill='toself', line_color='#8b5cf6')
-    fig_radar.update_layout(height=400, margin=dict(t=20, b=20, l=20, r=20))
-    st.plotly_chart(fig_radar, use_container_width=True)
+        if cart_lvl >= 9:
+            relic_item = f"🧭 The {r_concept} Astrolabe"
+        else:
+            relic_item = f"🕯️ {r_concept} Lantern"
+
+        with st.container(border=True):
+            st.subheader(f"🛒 The Daily Merchant ({date.today().strftime('%b %d')})")
+            st.markdown(f"**Available Gold:** 💰 {current_gold}")
+
+            col_s1, col_s2, col_s3 = st.columns(3)
+
+
+            def buy_item(item_name, cost):
+                # 1. Update Session State (Instant UI)
+                db_stats['spent_gold'] += cost
+                display_case.append(item_name)
+                db_stats['inventory']['display_case'] = display_case
+                st.session_state['db_stats'] = db_stats
+
+                # 2. Sync to Database
+                update_user_stats({
+                    "spent_gold": db_stats['spent_gold'],
+                    "inventory":  db_stats['inventory']
+                })
+
+                st.toast(f"Purchased {item_name}!", icon="🎉")
+                st.rerun()
+
+
+            with col_s1:
+                st.info(f"**Main Hand**\n\n{weapon_item}")
+                if weapon_item in display_case:
+                    st.button("Sold Out", disabled=True, key="so_w", use_container_width=True)
+                elif current_gold >= 50:
+                    if st.button("Buy for 💰 50", key="buy_w", use_container_width=True):
+                        buy_item(weapon_item, 50)
+                else:
+                    st.button("Needs 💰 50", disabled=True, key="poor_w", use_container_width=True)
+
+            with col_s2:
+                st.info(f"**Body Armor**\n\n{armor_item}")
+                if armor_item in display_case:
+                    st.button("Sold Out", disabled=True, key="so_a", use_container_width=True)
+                elif current_gold >= 100:
+                    if st.button("Buy for 💰 100", key="buy_a", use_container_width=True):
+                        buy_item(armor_item, 100)
+                else:
+                    st.button("Needs 💰 100", disabled=True, key="poor_a", use_container_width=True)
+
+            with col_s3:
+                st.info(f"**Accessory**\n\n{relic_item}")
+                if relic_item in display_case:
+                    st.button("Sold Out", disabled=True, key="so_r", use_container_width=True)
+                elif current_gold >= 75:
+                    if st.button("Buy for 💰 75", key="buy_r", use_container_width=True):
+                        buy_item(relic_item, 75)
+                else:
+                    st.button("Needs 💰 75", disabled=True, key="poor_r", use_container_width=True)
+
+        with st.container(border=True):
+            st.subheader("🏛️ The Grand Hall of Relics")
+            st.markdown("Your historical collection of academic artifacts.")
+
+            if display_case:
+                weapons = [item for item in display_case if any(icon in item for icon in ['🗡️', '🏹', '📖'])]
+                armors = [item for item in display_case if any(icon in item for icon in ['🛡️', '🧥', '👕'])]
+                relics = [item for item in display_case if any(icon in item for icon in ['🧭', '🕯️'])]
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.markdown("**🗡️ Weapons**")
+                    for w in reversed(weapons):
+                        st.caption(w)
+                with c2:
+                    st.markdown("**🛡️ Armor**")
+                    for a in reversed(armors):
+                        st.caption(a)
+                with c3:
+                    st.markdown("**🧭 Relics**")
+                    for r in reversed(relics):
+                        st.caption(r)
+            else:
+                st.info("The hall is empty. Check the Bounty Board to earn your first gold!")
