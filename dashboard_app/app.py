@@ -124,6 +124,37 @@ def load_data():
     return decks, notes, cards, revlog
 
 
+def get_user_stats():
+    res = supabase.table('user_stats').select('*').eq('id', 'lukas').execute()
+    return res.data[0] if res.data else None
+
+def update_user_stats(updates):
+    supabase.table('user_stats').update(updates).eq('id', 'lukas').execute()
+
+
+def calculate_rpg_state(cards_df, revlog_df, db_stats):
+    """Calculates the current state of the player based on deck performance."""
+    # 1. Base Stats
+    mature_count = len(cards_df[cards_df['knowledge_state'] == 'Known'])
+    avg_s = cards_df['s'].mean() if 's' in cards_df.columns else 0
+
+    # 2. XP & Gold Ledger
+    total_xp = int((mature_count * 20) + (avg_s * 10))
+    gross_gold = int(total_xp * 0.1)
+
+    # 3. Interest (Bonus for high stability)
+    interest = int(gross_gold * 0.05) if avg_s > 21 else 0
+
+    # 4. Taxes (Penalty for 'Again' presses today)
+    today_fails = len(revlog_df[(revlog_df['review_date'] == date.today()) & (revlog_df['ease'] == 1)])
+    daily_tax = today_fails * 10
+
+    current_gold = max(0, (gross_gold + interest) - (db_stats.get('spent_gold', 0) + daily_tax))
+
+    # RETURN ALL VARIABLES TO AVOID NAMEERRORS
+    return total_xp, current_gold, gross_gold, interest, daily_tax, avg_s
+
+
 with st.spinner("Loading & crunching Anki data..."):
     decks_df, notes_df, cards_df, revlog_df = load_data()
 
@@ -175,6 +206,7 @@ if days_left > 0:
     else:
         st.sidebar.success("✅ Pace is manageable.")
 
+
 if st.sidebar.button("🔄 Clear Cache & Re-sync"):
     st.cache_data.clear()
     st.rerun()
@@ -216,8 +248,8 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Tag Analytics", "🔍 Problem Cards", "🌌 3D Map", "🎯 Readiness", "Meta Clustering"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Tag Analytics", "🔍 Problem Cards", "🌌 3D Map", "🎯 Readiness", "Meta Clustering", "Game"
 ])
 
 # --- TAB 1: OVERVIEW ---
@@ -416,6 +448,8 @@ with tab3:
 
         fig_heat.update_layout(xaxis_nticks=24)
         st.plotly_chart(fig_heat, use_container_width=True)
+
+
 
 # --- TAB 4: TAG ANALYTICS ---
 # --- TAB 4: REFINED TAG ANALYTICS ---
@@ -863,3 +897,117 @@ with tab8:
                 st.warning("Not enough clean data left for this operation.")
     else:
         st.info("Insufficient FSRS history to generate this map. Keep reviewing!")
+
+# --- TAB 9: THE ADVENTURER'S GUILD (SKILLS, TAXES & INTEREST) ---
+
+# --- TAB 9: THE ADVENTURER'S GUILD (XP, BOSSES & SKILLS) ---
+with tab9:
+    # 1. THE CALCULATION ENGINE (Unpack everything here to avoid NameErrors)
+    db_stats = get_user_stats()
+
+    # Run the RPG state logic (Assumes calculate_rpg_state is defined as per our previous turn)
+    total_xp, current_gold, gross_gold, interest, daily_tax, avg_s = calculate_rpg_state(
+        filtered_cards, filtered_revlog, db_stats
+    )
+
+    # Derive Levels and Skills
+    user_level = int((total_xp / 150) ** 0.5) + 1
+    fortitude_lvl = int(avg_s / 5)
+
+    retention = (filtered_revlog['ease'] > 1).mean() * 100 if not filtered_revlog.empty else 0
+    precision_lvl = int(retention / 10)
+
+    avg_time = filtered_revlog['time'].mean() / 1000 if not filtered_revlog.empty else 0
+    celerity_lvl = int(max(0, 100 - (avg_time * 5)) / 10)
+
+    seen_cards = len(filtered_cards[filtered_cards['knowledge_state'] != 'Unseen'])
+    total_cards = len(filtered_cards)
+    cart_lvl = int((seen_cards / total_cards) * 10) if total_cards > 0 else 0
+
+    # 2. XP PROGRESSION BAR
+    st.header(f"🛡️ Rank {user_level} Scholar")
+
+    xp_for_current = (user_level - 1) ** 2 * 150
+    xp_for_next = user_level ** 2 * 150
+    # Prevent division by zero and ensure range 0.0 - 1.0
+    denom = (xp_for_next - xp_for_current)
+    lvl_progress = (total_xp - xp_for_current) / denom if denom > 0 else 0
+
+    st.progress(min(max(lvl_progress, 0.0), 1.0),
+                text=f"✨ {total_xp - xp_for_current} / {denom} XP to Level {user_level + 1}")
+
+    col_v1, col_v2, col_v3 = st.columns(3)
+    col_v1.metric("Gold Balance", f"💰 {current_gold}")
+    col_v2.metric("Gross Gold", f"🪙 {gross_gold}")
+    col_v3.metric("Daily Interest", f"📈 +{interest}")
+
+    st.divider()
+
+    # 3. DYNAMIC DAILY BOUNTIES
+    st.subheader("📜 Dynamic Daily Bounties")
+
+    # Calculate goals based on actual deck state
+    cards_due_today = len(filtered_cards[filtered_cards['s'] < 1])
+    unseen_remaining = total_cards - seen_cards
+
+    scribe_goal = max(20, min(100, cards_due_today))
+    explorer_goal = max(5, min(25, int(unseen_remaining * 0.05)))
+
+    today_revs = filtered_revlog[filtered_revlog['review_date'] == date.today()]
+    today_count = len(today_revs)
+    today_new = len(filtered_cards[filtered_cards['creation_date'] == date.today()])
+
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        st.write(f"**The Scribe** ({scribe_goal} Reviews)")
+        st.progress(min(1.0, today_count / scribe_goal) if scribe_goal > 0 else 1.0)
+        if today_count >= scribe_goal:
+            st.success("💰 +20 Gold")
+
+    with q2:
+        st.write(f"**The Explorer** ({explorer_goal} New)")
+        st.progress(min(1.0, today_new / explorer_goal) if explorer_goal > 0 else 1.0)
+        if today_new >= explorer_goal:
+            st.success("💰 +30 Gold")
+
+    with q3:
+        st.write("**The Perfectionist** (90% Acc)")
+        today_acc = (today_revs['ease'] > 1).mean() * 100 if today_count > 0 else 0
+        st.progress(min(1.0, today_acc / 90))
+        if today_acc >= 90 and today_count >= 10:
+            st.success("💰 +50 Gold")
+
+    st.divider()
+
+    # 4. BOSS ENCOUNTERS (Semantic Instability)
+    st.subheader("👺 Active Bosses")
+
+    if 'cluster' in filtered_cards.columns:
+        # Identify 'Fragile' semantic clusters
+        cluster_stats = filtered_cards.groupby('cluster').agg(
+            avg_stability=('s', 'mean'),
+            count=('id', 'count')
+        )
+        bosses = cluster_stats[(cluster_stats['avg_stability'] < 3) & (cluster_stats['count'] > 10)]
+
+        if not bosses.empty:
+            target_id = bosses.index[0]
+            st.error(f"⚠️ **BOSS SPAWNED: Cluster {target_id} is Fading!**")
+            if st.button("⚔️ Challenge Boss", key="btn_boss"):
+                boss_cards = filtered_cards[filtered_cards['cluster'] == target_id]
+                st.dataframe(boss_cards[['clean_text', 'd', 's']].sort_values('d', ascending=False))
+        else:
+            st.success("The semantic horizon is clear. No bosses detected.")
+
+    st.divider()
+
+    # 5. CHARACTER ATTRIBUTES (SPIDER GRAPH)
+    st.subheader("⚔️ Character Attributes")
+    radar_data = pd.DataFrame(dict(
+        r=[fortitude_lvl, precision_lvl, celerity_lvl, cart_lvl, fortitude_lvl],
+        theta=['Fortitude', 'Precision', 'Celerity', 'Cartography', 'Fortitude']
+    ))
+    fig_radar = px.line_polar(radar_data, r='r', theta='theta', line_close=True)
+    fig_radar.update_traces(fill='toself', line_color='#8b5cf6')
+    fig_radar.update_layout(height=400, margin=dict(t=20, b=20, l=20, r=20))
+    st.plotly_chart(fig_radar, use_container_width=True)
