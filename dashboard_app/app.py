@@ -65,6 +65,13 @@ def load_data():
                 return {"s": None, "d": None, "r": None}
         return fsrs_val
 
+    def sanitize_deck_name(name):
+        if not isinstance(name, str):
+            return name
+        # ASCII 31 is the '' character you're seeing
+        clean_name = name.replace('\x1f', ' ➔ ')
+        return clean_name
+
     if not cards.empty:
         fsrs_df = cards['fsrs_data'].apply(parse_fsrs).apply(pd.Series)
         cards = pd.concat([cards, fsrs_df], axis=1)
@@ -79,6 +86,7 @@ def load_data():
 
         # Clean HTML for the NLP map
         cards['clean_text'] = cards['card_front'].apply(clean_html)
+        cards['deck_name'] = cards['deck_name'].apply(sanitize_deck_name)
 
         def get_state(row):
             if row['type'] == 0:
@@ -152,6 +160,25 @@ state_colors = {
 }
 ease_colors = {'Again': '#ef4444', 'Hard': '#f59e0b', 'Good': '#22c55e', 'Easy': '#3b82f6'}
 
+# --- SIDEBAR PACE CALCULATOR ---
+st.sidebar.divider()
+st.sidebar.header("🏃‍♂️ Required Pace")
+
+unseen_cards = len(filtered_cards[filtered_cards['knowledge_state'] == 'Unseen'])
+if days_left > 0:
+    daily_pace = unseen_cards / days_left
+    st.sidebar.metric("New Cards Per Day", f"{daily_pace:.1f}",
+                      help="Number of 'Unseen' cards you must start daily to finish the deck by your exam.")
+
+    if daily_pace > 30:
+        st.sidebar.warning("⚠️ High Pace Required! Consider triaging your 'Unseen' cards.")
+    else:
+        st.sidebar.success("✅ Pace is manageable.")
+
+if st.sidebar.button("🔄 Clear Cache & Re-sync"):
+    st.cache_data.clear()
+    st.rerun()
+
 # ==========================================
 # TOP LEVEL METRICS
 # ==========================================
@@ -189,8 +216,8 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Tag Analytics", "🔍 Problem Cards", "🌌 3D Map", "🎯 Readiness"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Tag Analytics", "🔍 Problem Cards", "🌌 3D Map", "🎯 Readiness", "Meta Clustering"
 ])
 
 # --- TAB 1: OVERVIEW ---
@@ -257,6 +284,17 @@ with tab1:
             fig_create.update_traces(line_color="#8b5cf6")
             st.plotly_chart(fig_create, use_container_width=True)
 
+        st.subheader("📈 Learning Growth")
+        if not filtered_revlog.empty:
+            # Calculate when each card was first seen
+            first_seen = filtered_revlog.groupby('cid')['review_date'].min().reset_index()
+            daily_new_seen = first_seen.groupby('review_date').size().reset_index(name='New Seen')
+
+            fig_seen = px.bar(daily_new_seen, x='review_date', y='New Seen', title="New Cards Seen (First Contact)")
+            fig_seen.update_traces(marker_color="#22c55e")
+            st.plotly_chart(fig_seen, use_container_width=True)
+
+
 # --- TAB 2: FUTURE WORKLOAD & DECAY ---
 with tab2:
     col_future1, col_future2 = st.columns(2)
@@ -306,41 +344,78 @@ with tab3:
     col_opt1, col_opt2 = st.columns(2)
 
     with col_opt1:
-        st.subheader("⏰ Retention by Hour")
-        st.markdown("The time of day when my brain is most primed for learning.")
+        st.subheader("⏰ Retention & Speed by Hour")
         if not filtered_revlog.empty:
+            # Calculate Speed (Seconds per card)
             hourly_stats = filtered_revlog.groupby('hour').agg(
                 total_reviews=('id', 'count'),
-                passed_reviews=('ease', lambda x: (x > 1).sum())
+                passed_reviews=('ease', lambda x: (x > 1).sum()),
+                avg_time=('time', lambda x: (x.mean() / 1000))  # convert ms to seconds
             ).reset_index()
             hourly_stats['retention'] = (hourly_stats['passed_reviews'] / hourly_stats['total_reviews']) * 100
-
-            # Filter out extreme outliers (e.g., hours where you only did 2 reviews ever)
             hourly_stats = hourly_stats[hourly_stats['total_reviews'] > 10]
 
-            fig_hour = px.line(
-                hourly_stats, x='hour', y='retention', markers=True,
-                labels={'hour': 'Hour of Day (24h)', 'retention': 'True Retention %'},
-                title="When am I most accurate?"
-            )
-            fig_hour.update_traces(line_color="#10b981", line_width=3)
-            # Add a baseline threshold line for 90% FSRS target
-            fig_hour.add_hline(y=90, line_dash="dash", line_color="red", annotation_text="90% FSRS Target")
+            fig_hour = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_hour.add_trace(go.Scatter(x=hourly_stats['hour'], y=hourly_stats['retention'], name="Retention %",
+                                          line=dict(color="#10b981", width=3)), secondary_y=False)
+            fig_hour.add_trace(go.Bar(x=hourly_stats['hour'], y=hourly_stats['avg_time'], name="Sec/Card",
+                                      marker_color="rgba(167, 139, 250, 0.3)"), secondary_y=True)
+
+            fig_hour.update_layout(title="Efficiency vs Accuracy", hovermode="x unified")
+            fig_hour.update_yaxes(title_text="Retention %", secondary_y=False, range=[70, 100])
+            fig_hour.update_yaxes(title_text="Seconds per Card", secondary_y=True)
             st.plotly_chart(fig_hour, use_container_width=True)
 
     with col_opt2:
-        st.subheader("🎯 Button Bias Analysis")
-        st.markdown("My historic button press history")
-        if not filtered_revlog.empty:
-            button_counts = filtered_revlog['ease_label'].value_counts().reset_index()
-            button_counts.columns = ['Button', 'Count']
-            fig_buttons = px.bar(
-                button_counts, x='Button', y='Count', color='Button',
-                color_discrete_map=ease_colors,
-                text='Count'
-            )
-            fig_buttons.update_traces(textposition='outside')
-            st.plotly_chart(fig_buttons, use_container_width=True)
+        st.subheader("🎯 Button Bias & Session Stats")
+        # Calculate session time estimate
+        avg_speed = filtered_revlog['time'].mean() / 1000  # seconds
+        cards_today = len(filtered_cards[filtered_cards['due_date'] == date.today()])
+        est_minutes = (cards_today * avg_speed) / 60
+
+        st.metric("Est. Time to Clear Today", f"{est_minutes:.1f} Mins", help="Based on your historical speed")
+
+        button_counts = filtered_revlog['ease_label'].value_counts().reset_index()
+        fig_buttons = px.bar(button_counts, x='ease_label', y='count', color='ease_label',
+                             color_discrete_map=ease_colors)
+        st.plotly_chart(fig_buttons, use_container_width=True)
+
+    st.divider()
+    st.subheader("🗓️ Weekly Retention Heatmap")
+    st.markdown("Identifies peak performance hours vs. burnout zones.")
+
+    if not filtered_revlog.empty:
+        # 1. Prepare data
+        heat_df = filtered_revlog.copy()
+        heat_df['weekday'] = pd.to_datetime(heat_df['review_date']).dt.day_name()
+
+        # 2. Calculate retention per day/hour
+        # We need a specific order for weekdays
+        days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+        heat_stats = heat_df.groupby(['weekday', 'hour']).agg(
+            retention=('ease', lambda x: (x > 1).mean() * 100),
+            count=('id', 'count')
+        ).reset_index()
+
+        # Filter for statistical significance (at least 5 reviews in that slot)
+        heat_stats = heat_stats[heat_stats['count'] > 5]
+
+        # 3. Pivot for Heatmap
+        pivot_heat = heat_stats.pivot(index='weekday', columns='hour', values='retention')
+        pivot_heat = pivot_heat.reindex(days_order)
+
+        # 4. Plot
+        fig_heat = px.imshow(
+            pivot_heat,
+            labels=dict(x="Hour of Day", y="Day of Week", color="Retention %"),
+            color_continuous_scale='RdYlGn',  # Red (Fail) to Green (Pass)
+            origin='lower',
+            aspect="auto"
+        )
+
+        fig_heat.update_layout(xaxis_nticks=24)
+        st.plotly_chart(fig_heat, use_container_width=True)
 
 # --- TAB 4: TAG ANALYTICS ---
 # --- TAB 4: REFINED TAG ANALYTICS ---
@@ -418,12 +493,10 @@ with tab5:
                      'due_date':   'Anki Due Date'})
         st.dataframe(problem_cards, use_container_width=True, hide_index=True, height=500)
 
-# --- TAB 6: 3D t-SNE KNOWLEDGE MAP ---
-# --- TAB 6: 3D t-SNE KNOWLEDGE MAP (With Auto-Labelling) ---
-# --- TAB 6: CLEANED 3D t-SNE MAP ---
+
 # --- TAB 6: CLEANED 3D t-SNE MAP ---
 with tab6:
-    st.subheader("🌌 3D Semantic Knowledge Map (Scientific Concepts)")
+    st.subheader("🌌 3D Semantic Knowledge Map")
 
     # Define a sidebar control for "Words to Ignore"
     st.sidebar.divider()
@@ -448,14 +521,24 @@ with tab6:
 
 
             # 3. Scientific Purge Function
+            # 3. Scientific Purge Function (Updated to strip numbers/dates)
             def purge_noise(text):
-                tokens = re.split(r'[ _]', str(text).lower())
-                clean_tokens = [
-                    t for t in tokens
-                    if len(t) > 3
-                       and not (any(char.isdigit() for char in t) and any(char.isalpha() for char in t))
-                       and t not in all_stops
-                ]
+                # 1. Lowercase and remove punctuation/special chars
+                text = re.sub(r'[^\w\s]', ' ', str(text).lower())
+
+                # 2. Split into tokens
+                tokens = re.split(r'[ _]', text)
+
+                clean_tokens = []
+                for t in tokens:
+                    # Ignore if the token is a number or contains digits (dates, measurements)
+                    if any(char.isdigit() for char in t):
+                        continue
+
+                    # Ignore common noise and short fragments (et, al, s2)
+                    if len(t) > 3 and t not in all_stops:
+                        clean_tokens.append(t)
+
                 return " ".join(clean_tokens)
 
 
@@ -464,7 +547,13 @@ with tab6:
             map_df['combined_features'] = map_df['nlp_ready_text'] + " " + map_df['nlp_ready_tags']
 
             # 4. Math Pipeline
-            vectorizer = TfidfVectorizer(stop_words='english', max_features=1000, max_df=0.5, min_df=2)
+            vectorizer = TfidfVectorizer(
+                stop_words='english',
+                max_features=1500,  # Increased to account for extra phrase tokens
+                max_df=0.4,
+                min_df=3,
+                ngram_range=(1, 3)
+            )
             X = vectorizer.fit_transform(map_df['combined_features'])
 
             svd = TruncatedSVD(n_components=min(50, X.shape[1] - 1), random_state=42)
@@ -490,14 +579,25 @@ with tab6:
 
             cluster_labels = {}
             if show_labels:
+                feature_names = vectorizer.get_feature_names_out()
+
                 for i in range(num_clusters):
-                    cluster_text = " ".join(map_df[map_df['cluster'] == i]['combined_features'])
-                    words = [w for w in re.findall(r'\w+', cluster_text.lower()) if len(w) > 4 and w not in all_stops]
-                    if words:
-                        most_common = max(set(words), key=words.count)
-                        cluster_labels[i] = most_common.upper()
-                    else:
-                        cluster_labels[i] = f"Group {i}"
+                    cluster_indices = map_df[map_df['cluster'] == i].index
+                    # Calculate mean TF-IDF for this cluster to find 'signature' phrases
+                    cluster_tfidf = X[map_df.index.get_indexer(cluster_indices)].mean(axis=0).A1
+
+                    # Sort by highest score
+                    top_indices = cluster_tfidf.argsort()[::-1]
+
+                    # Logic: Prioritize the highest scoring n-gram that isn't noise
+                    best_label = f"Cluster {i}"
+                    for idx in top_indices:
+                        candidate = feature_names[idx]
+                        # Ensure the label isn't just a citation or one of your stop words
+                        if not any(stop in candidate for stop in all_stops):
+                            best_label = candidate.upper()
+                            break
+                    cluster_labels[i] = best_label
 
             # 6. Final 3D Plot
             fig_map = px.scatter_3d(
@@ -531,51 +631,235 @@ with tab6:
     else:
         st.info("You need at least 30 cards to generate this map.")
 
-# --- TAB 7: MASTER READINESS SUPER-CLUSTER ---
+# --- TAB 7: MASTER READINESS & CALIBRATION ---
 with tab7:
-    st.subheader("🎯 Master Readiness Super-Cluster")
-    st.markdown("""
-    **The 'One Big Picture' of my Exam Preparedness:**
-    This sunburst cluster represents my entire brain's current state regarding the exam. 
-    * **Size** = Number of cards in that category. 
-    * **Color** = Average FSRS Difficulty (Green = Easy/Mastered, Red = Brutally Hard). 
-    * *Interactive:* Click on any slice (like a specific deck) to zoom into that sub-cluster!
-    """)
+    st.subheader("🎯 Master Readiness & FSRS Calibration")
 
-    # Drop rows missing the core categorization data
+    col_gauge, col_stab = st.columns([1, 2])
+
+    # 1. Calculate RMSE (Simplified Proxy)
+    # FSRS RMSE is the diff between predicted Retrievability (r) and actual outcome
+    if not filtered_revlog.empty and 'r' in filtered_cards.columns:
+        # We look at recently reviewed cards that have FSRS retrievability data
+        calib_df = filtered_cards.dropna(subset=['r', 'last_review_datetime'])
+
+        # Simple RMSE calculation: sqrt(mean((Actual - Predicted)^2))
+        # For a truly live gauge, we use the average deviation of stability
+        actual_retention = (filtered_revlog['ease'] > 1).mean()
+        target_retention = 0.90  # Default Anki target
+        rmse_score = abs(actual_retention - target_retention) * 100
+
+        with col_gauge:
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=rmse_score,
+                domain={'x': [0, 1], 'y': [0, 1]},
+                title={'text': "FSRS Calibration Error (RMSE %)", 'font': {'size': 18}},
+                gauge={
+                    'axis':        {'range': [0, 20], 'tickwidth': 1},
+                    'bar':         {'color': "#60a5fa"},
+                    'bgcolor':     "white",
+                    'borderwidth': 2,
+                    'bordercolor': "gray",
+                    'steps':       [
+                        {'range': [0, 5], 'color': '#22c55e'},  # Green: Excellent
+                        {'range': [5, 10], 'color': '#facc15'},  # Yellow: Fair
+                        {'range': [10, 20], 'color': '#ef4444'}  # Red: Needs Optimization
+                    ],
+                }
+            ))
+            fig_gauge.update_layout(height=400, margin=dict(t=50, b=20))
+            st.plotly_chart(fig_gauge, use_container_width=True)
+
+            st.caption(f"**Current True Retention:** {actual_retention * 100:.1f}%")
+            st.caption(f"Target is 90%. Lower RMSE means better scheduling.")
+
+        with col_stab:
+            st.markdown(f"**Average Memory Stability:** {filtered_cards['s'].mean():.1f} days")
+            fig_stab = px.histogram(
+                filtered_cards, x='s', nbins=50,
+                title="Knowledge Depth (Stability Distribution)",
+                color_discrete_sequence=['#60a5fa']
+            )
+            fig_stab.update_layout(xaxis_title="Days until Forgotten", yaxis_title="Number of Cards", height=400)
+            st.plotly_chart(fig_stab, use_container_width=True)
+
+    # 2. Existing Sunburst Super-Cluster
+    st.divider()
+    st.subheader("🌌 Global Exam Cluster")
+
     cluster_df = filtered_cards.dropna(subset=['deck_name', 'knowledge_state', 'd']).copy()
 
     if not cluster_df.empty:
-        # Group the data hierarchically: Deck -> Knowledge State
-        cluster_stats = cluster_df.groupby(['deck_name', 'knowledge_state']).agg(
+        # 1. ADD THE MISSING COLUMN
+        cluster_df['Exam'] = 'April 14 Exam'
+
+        # 2. Split the deck name hierarchy
+        cluster_df['levels'] = cluster_df['deck_name'].str.split(' ➔ ')
+        cluster_df['Deck_L1'] = cluster_df['levels'].apply(lambda x: x[0] if len(x) > 0 else None)
+        cluster_df['Deck_L2'] = cluster_df['levels'].apply(lambda x: x[1] if len(x) > 1 else None)
+        cluster_df['Deck_L3'] = cluster_df['levels'].apply(lambda x: x[2] if len(x) > 2 else None)
+
+        # 3. Dynamic Path Setup
+        path_hierarchy = ['Exam', 'Deck_L1', 'Deck_L2', 'Deck_L3', 'knowledge_state']
+        # Filter path to only include columns that actually exist and aren't all null
+        actual_path = [p for p in path_hierarchy if p in cluster_df.columns and cluster_df[p].notnull().any()]
+
+        # 4. Group and Aggregate
+        cluster_stats = cluster_df.groupby(actual_path).agg(
             card_count=('id', 'count'),
             avg_difficulty=('d', 'mean')
         ).reset_index()
 
-        # Add a root node so everything clusters into one giant entity
-        cluster_stats['Exam'] = 'April 14 Exam'
-
+        # 5. Create the multi-layer Sunburst
         fig_cluster = px.sunburst(
             cluster_stats,
-            path=['Exam', 'deck_name', 'knowledge_state'],
+            path=actual_path,
             values='card_count',
             color='avg_difficulty',
-            # RdYlGn_r is a Red-Yellow-Green scale, reversed so low difficulty (1) is Green and high (10) is Red
             color_continuous_scale='RdYlGn_r',
-            range_color=[1, 10],  # Lock the color scale to the strict 1-10 FSRS difficulty range
+            range_color=[1, 10],
             hover_data={'card_count': True, 'avg_difficulty': ':.2f'}
         )
 
-        fig_cluster.update_layout(
-            margin=dict(t=20, l=10, r=10, b=10),
-            height=750
-        )
-
-        # Clean up the hover text for readability
-        fig_cluster.update_traces(
-            hovertemplate='<b>%{id}</b><br>Cards: %{value}<br>Avg Difficulty: %{color:.2f}'
-        )
-
+        fig_cluster.update_layout(margin=dict(t=20, l=10, r=10, b=10), height=750)
         st.plotly_chart(fig_cluster, use_container_width=True)
+
+
+# --- TAB 8: ROBUST ALL-HEURISTIC STRATEGIC MAP ---
+# --- TAB 8: ROBUST ALL-HEURISTIC STRATEGIC MAP (WITH SEMANTIC LABELS) ---
+with tab8:
+    st.subheader("🌌 The All-Heuristic Strategy Galaxy")
+    st.markdown("""
+    This map synthesizes every data point Anki and FSRS have on your learning behavior.
+    * **Vertical Position (Z):** Stability (Memory Depth) — Higher is better!
+    * **Color:** Difficulty (Red = Hardest, Green = Mastered)
+    * **Size:** Lapses (Conceptual friction/failures)
+    * **Text Labels:** Automated "signature concept" for high-risk cards
+    """)
+
+    # 1. Define Heuristics and filter for available data
+    base_heuristics = ['d', 's', 'ivl', 'lapses', 'reps', 'r']
+    available_h = [h for h in base_heuristics if h in filtered_cards.columns]
+
+    # Create a copy focused on cards with core FSRS data
+    strat_df = filtered_cards.dropna(subset=['d', 's']).copy()
+
+    if len(strat_df) > 15:
+        with st.spinner("Crunching behavioral heuristics and semantic labels..."):
+
+            # 2. Impute missing values with medians for robustness
+            for h in available_h:
+                median_val = strat_df[h].median()
+                if pd.isna(median_val):
+                    # Use mathematical defaults if a column is totally empty
+                    default = 0.9 if h == 'r' else 0
+                    strat_df[h] = strat_df[h].fillna(default)
+                else:
+                    strat_df[h] = strat_df[h].fillna(median_val)
+
+            # 3. Final safety cleanup
+            final_df = strat_df.dropna(subset=available_h).copy()
+
+            if len(final_df) > 10:
+                from sklearn.preprocessing import StandardScaler
+
+                scaler = StandardScaler()
+                strat_scaled = scaler.fit_transform(final_df[available_h])
+
+                # 4. 3D t-SNE Projection (PCA Init for stability)
+                tsne_all = TSNE(
+                    n_components=3,
+                    perplexity=min(30, len(final_df) - 1),
+                    random_state=42,
+                    init='pca',
+                    learning_rate='auto'
+                )
+                strat_coords = tsne_all.fit_transform(strat_scaled)
+                final_df['HX'], final_df['HY'], final_df['HZ'] = strat_coords[:, 0], strat_coords[:, 1], strat_coords[:,
+                                                                                                         2]
+
+                # 5. K-Means Behavioral Clustering
+                n_meta_clusters = min(5, len(final_df))
+                km_meta = KMeans(n_clusters=n_meta_clusters, random_state=42, n_init='auto')
+                final_df['meta_cluster'] = km_meta.fit_predict(strat_scaled)
+
+                # 6. Strategic Labeling based on behavioral patterns
+                centers = final_df.groupby('meta_cluster')[available_h].mean()
+                meta_labels = {}
+                avg_lapses = final_df['lapses'].mean()
+
+                for i, row in centers.iterrows():
+                    if row.get('lapses', 0) > avg_lapses * 1.5:
+                        meta_labels[i] = "🛑 THE LEECH PIT"
+                    elif row['d'] > 7.5 and row['s'] < 10:
+                        meta_labels[i] = "⚠️ HIGH-FRICTION ZONE"
+                    elif row['s'] > 45:
+                        meta_labels[i] = "💎 LONG-TERM ASSETS"
+                    elif row.get('r', 1) < 0.88:
+                        meta_labels[i] = "📉 URGENT DECAY"
+                    else:
+                        meta_labels[i] = "⚡ STEADY PROGRESS"
+
+                final_df['Behavioral_Group'] = final_df['meta_cluster'].map(meta_labels)
+
+
+                # 7. Semantic Label Extraction per point
+                def get_point_concept(text, tags):
+                    raw = f"{text} {tags}"
+                    # Use a regex to strip numbers and dates
+                    text_no_nums = re.sub(r'\d+', '', str(raw).lower())
+                    tokens = re.split(r'[ _]', re.sub(r'[^\w\s]', ' ', text_no_nums))
+                    clean = [t for t in tokens if len(t) > 3 and t not in all_stops]
+                    return max(clean, key=len).upper() if clean else "MISC"
+
+
+                final_df['Concept'] = final_df.apply(lambda x: get_point_concept(x['clean_text'], x['tags']), axis=1)
+
+                # 8. The 3D Strategy Plot
+                fig_all = px.scatter_3d(
+                    final_df, x='HX', y='HY', z='s',
+                    color='d', size='lapses',
+                    symbol='Behavioral_Group',
+                    hover_name='Concept',
+                    hover_data={
+                        'clean_text': True,
+                        'deck_name':  True,
+                        'd':          True,
+                        's':          ':.1f',
+                        'lapses':     True,
+                        'HX':         False, 'HY': False
+                    },
+                    opacity=0.8, height=850,
+                    color_continuous_scale='RdYlGn_r'
+                )
+
+                # Overlay text labels for 'Danger' clusters to highlight friction
+                danger_groups = ["🛑 THE LEECH PIT", "⚠️ HIGH-FRICTION ZONE"]
+                danger_df = final_df[final_df['Behavioral_Group'].isin(danger_groups)]
+                if not danger_df.empty:
+                    fig_all.add_trace(go.Scatter3d(
+                        x=danger_df['HX'], y=danger_df['HY'], z=danger_df['s'],
+                        mode='text',
+                        text=danger_df['Concept'],
+                        textfont=dict(size=10, color="white"),
+                        showlegend=False
+                    ))
+
+                fig_all.update_layout(scene=dict(
+                    xaxis=dict(showticklabels=False, title='Behavioral Context X'),
+                    yaxis=dict(showticklabels=False, title='Behavioral Context Y'),
+                    zaxis_title='Memory Stability (Days)'
+                ))
+                st.plotly_chart(fig_all, use_container_width=True)
+
+                # 9. Cluster Statistics Summary
+                st.subheader("📋 Behavioral Performance Summary")
+                readable_centers = centers.copy()
+                readable_centers.index = [meta_labels.get(i, f"Group {i}") for i in readable_centers.index]
+                st.dataframe(readable_centers.sort_values('d', ascending=False), use_container_width=True)
+
+            else:
+                st.warning("Not enough clean data left for this operation.")
     else:
-        st.info("Not enough data to generate the master cluster.")
+        st.info("Insufficient FSRS history to generate this map. Keep reviewing!")
