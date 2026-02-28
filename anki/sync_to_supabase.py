@@ -127,13 +127,27 @@ def sync_anki_to_supabase(dry_run=False):
     # ==========================================
     # 4. SYNC REVLOG (Append-only Delta Sync)
     # ==========================================
-    revlog_res = supabase.table('revlog').select('id').order('id', desc=True).limit(1).execute()
-    last_revlog_id = revlog_res.data[0]['id'] if revlog_res.data else 0
+    import time  # Make sure this is at the top of your file with the other imports!
+
+    # ==========================================
+    # 4. BULLETPROOF REVLOG SYNC (Rolling Window)
+    # ==========================================
+    # 1. Calculate a 14-day safety window in milliseconds
+    lookback_window_ms = 14 * 24 * 60 * 60 * 1000
+    current_time_ms = int(time.time() * 1000)
+
+    # 2. Get the highest REALISTIC timestamp from Supabase (ignores future poison pills)
+    revlog_res = supabase.table('revlog').select('id').lte('id', current_time_ms).order('id', desc=True).limit(
+        1).execute()
+    safe_last_id = revlog_res.data[0]['id'] if revlog_res.data else 0
+
+    # 3. Step back 14 days from our last sync point to catch delayed phone syncs
+    sync_from_id = max(0, safe_last_id - lookback_window_ms)
 
     cursor.execute("""
-        SELECT id, cid, ease, ivl, lastIvl, factor, time, type 
-        FROM revlog WHERE id > ?
-    """, (last_revlog_id,))
+            SELECT id, cid, ease, ivl, lastIvl, factor, time, type 
+            FROM revlog WHERE id > ?
+        """, (sync_from_id,))
     new_reviews = cursor.fetchall()
 
     if new_reviews:
@@ -144,12 +158,13 @@ def sync_anki_to_supabase(dry_run=False):
             } for r in new_reviews
         ]
         if not dry_run:
-            supabase.table('revlog').insert(revlog_payload).execute()
-            print(f"✅ Inserted {len(revlog_payload)} new reviews.")
+            # 4. Use UPSERT instead of INSERT to safely merge overlaps without primary key crashes
+            supabase.table('revlog').upsert(revlog_payload).execute()
+            print(f"✅ Upserted {len(revlog_payload)} recent reviews (caught any delayed syncs!).")
         else:
-            print(f"🟡 [DRY RUN] Would insert {len(revlog_payload)} new reviews.")
+            print(f"🟡 [DRY RUN] Would upsert {len(revlog_payload)} recent reviews.")
     else:
-        print("➖ No new reviews to sync.")
+        print("➖ No new reviews found in the lookback window.")
 
     conn.close()
     print("\nSync process finished!")

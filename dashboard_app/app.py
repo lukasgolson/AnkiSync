@@ -53,12 +53,30 @@ def clean_html(raw_html):
     return re.sub(cleanr, ' ', raw_html).strip()
 
 
+def fetch_all(table_name, select_query='*'):
+    """Paginates through Supabase to bypass the 1,000 row API limit."""
+    all_data = []
+    page_size = 1000
+    offset = 0
+
+    while True:
+        response = supabase.table(table_name).select(select_query).range(offset, offset + page_size - 1).execute()
+        records = response.data
+        all_data.extend(records)
+
+        if len(records) < page_size:
+            break
+
+        offset += page_size
+
+    return pd.DataFrame(all_data)
+
 @st.cache_data(ttl=3600)
 def load_data():
-    decks = pd.DataFrame(supabase.table('decks').select('*').execute().data)
-    notes = pd.DataFrame(supabase.table('notes').select('id, sfld, tags').execute().data)
-    cards = pd.DataFrame(supabase.table('cards').select('*').execute().data)
-    revlog = pd.DataFrame(supabase.table('revlog').select('*').execute().data)
+    decks = fetch_all('decks')
+    notes = fetch_all('notes', 'id, sfld, tags')
+    cards = fetch_all('cards')
+    revlog = fetch_all('revlog')
 
     if not revlog.empty:
         revlog['review_datetime'] = pd.to_datetime(revlog['id'], unit='ms')
@@ -185,7 +203,7 @@ with st.spinner("Loading & crunching Anki data..."):
     decks_df, notes_df, cards_df, revlog_df = load_data()
 
 if cards_df.empty or revlog_df.empty:
-    st.warning("No data found! Please make sure you've run your sync script.")
+    st.warning("No data found!")
     st.stop()
 
 # ==========================================
@@ -225,7 +243,7 @@ unseen_cards = len(filtered_cards[filtered_cards['knowledge_state'] == 'Unseen']
 if days_left > 0:
     daily_pace = unseen_cards / days_left
     st.sidebar.metric("New Cards Per Day", f"{daily_pace:.1f}",
-                      help="Cards you must start daily to finish the deck.")
+                      help="Cards I must start daily to finish the deck.")
     if daily_pace > 30:
         st.sidebar.warning("⚠️ High Pace Required! Consider triaging 'Unseen' cards.")
     else:
@@ -277,14 +295,16 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, mapping, tab7, tab9 = st.tabs([
-    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness", "Game"
+tab1, tab2, tab3, tab4, mapping, tab7, tab9, tab10 = st.tabs([
+    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness", "Game", "Oracle"
 ])
 
 # --- TAB 1: OVERVIEW ---
 with tab1:
 
-    with st.expander("📖 About this Dashboard: A Data-Driven Approach to Comp Prep", expanded=True):
+    subtab1, subtab2, subtab3 = st.tabs(["About", "Charts", "Mastery"])
+
+    with subtab1:
         st.markdown("""
         I built this custom dashboard to take a quantitative, data-driven approach to my comprehensive exam prep. Instead of just guessing how well I know the material, this app pulls my raw flashcard data (from Anki) and uses a few data science techniques to measure my actual progress.
 
@@ -298,129 +318,391 @@ with tab1:
         ### 🌌 Mapping the Knowledge (NLP)
         I wanted to be able to visualize my knowledge geographically, so I added a Natural Language Processing pipeline. By applying **TF-IDF vectorization** and **K-Means clustering** to the raw text of my study materials, the app automatically groups related scientific concepts into "semantic islands." This powers the 3D map, letting me visually track which specific domains are stable and which are lagging.
 
-        ### ⚔️ Gamifying the Grind
-        Studying for comps is a marathon, so to keep the daily grind engaging, I built an RPG-style "Adventurer's Guild" on top of the data. The gamification is strictly tied to real metrics: my "XP" and "Gold" are mathematically derived from my FSRS Stability and True Retention. If a specific cluster of knowledge starts fading from my memory, the app spawns it as a "Boss" that I have to go review to defeat.
         """)
 
-    col_chart1, col_chart2 = st.columns([3, 2])
-    with col_chart1:
-        st.subheader("Daily Review Volume & Cumulative Total")
-        if not filtered_revlog.empty:
-            daily_reviews = filtered_revlog.groupby(['review_date', 'ease_label']).size().reset_index(name='count')
-            daily_totals = filtered_revlog.groupby('review_date').size().reset_index(name='daily_total').sort_values(
-                'review_date')
-            daily_totals['cumulative'] = daily_totals['daily_total'].cumsum()
+    with subtab2:
+        col_chart1, col_chart2 = st.columns([3, 2])
+        with col_chart1:
+            st.subheader("Daily Review Volume & Cumulative Total")
+            if not filtered_revlog.empty:
+                daily_reviews = filtered_revlog.groupby(['review_date', 'ease_label']).size().reset_index(name='count')
+                daily_totals = filtered_revlog.groupby('review_date').size().reset_index(name='daily_total').sort_values(
+                    'review_date')
+                daily_totals['cumulative'] = daily_totals['daily_total'].cumsum()
 
-            fig_bar = make_subplots(specs=[[{"secondary_y": True}]])
-            for ease in ['Again', 'Hard', 'Good', 'Easy']:
-                ease_data = daily_reviews[daily_reviews['ease_label'] == ease]
-                if not ease_data.empty:
-                    fig_bar.add_trace(go.Bar(x=ease_data['review_date'], y=ease_data['count'], name=ease,
-                                             marker_color=ease_colors[ease]), secondary_y=False)
+                fig_bar = make_subplots(specs=[[{"secondary_y": True}]])
+                for ease in ['Again', 'Hard', 'Good', 'Easy']:
+                    ease_data = daily_reviews[daily_reviews['ease_label'] == ease]
+                    if not ease_data.empty:
+                        fig_bar.add_trace(go.Bar(x=ease_data['review_date'], y=ease_data['count'], name=ease,
+                                                 marker_color=ease_colors[ease]), secondary_y=False)
 
-            fig_bar.add_trace(
-                go.Scatter(x=daily_totals['review_date'], y=daily_totals['cumulative'], name='Cumulative Reviews',
-                           mode='lines', line=dict(color='#8b5cf6', width=3)), secondary_y=True)
-            fig_bar.update_layout(barmode='stack', hovermode="x unified", margin=dict(t=10))
-            fig_bar.update_yaxes(title_text="Daily Reviews", secondary_y=False)
-            fig_bar.update_yaxes(title_text="Total Cumulative", secondary_y=True, showgrid=False)
-            st.plotly_chart(fig_bar, use_container_width=True)
+                fig_bar.add_trace(
+                    go.Scatter(x=daily_totals['review_date'], y=daily_totals['cumulative'], name='Cumulative Reviews',
+                               mode='lines', line=dict(color='#8b5cf6', width=3)), secondary_y=True)
+                fig_bar.update_layout(barmode='stack', hovermode="x unified", margin=dict(t=10))
+                fig_bar.update_yaxes(title_text="Daily Reviews", secondary_y=False)
+                fig_bar.update_yaxes(title_text="Total Cumulative", secondary_y=True, showgrid=False)
+                st.plotly_chart(fig_bar, use_container_width=True)
 
-    with col_chart2:
-        st.subheader("Knowledge Mastery Breakdown")
-        state_counts = filtered_cards['knowledge_state'].value_counts().reset_index()
-        state_counts.columns = ['State', 'Count']
-        fig_pie = px.pie(state_counts, values='Count', names='State', hole=0.4, color='State',
-                         color_discrete_map=state_colors)
-        st.plotly_chart(fig_pie, use_container_width=True)
+        with col_chart2:
+            st.subheader("Knowledge Mastery Breakdown")
+            state_counts = filtered_cards['knowledge_state'].value_counts().reset_index()
+            state_counts.columns = ['State', 'Count']
+            fig_pie = px.pie(state_counts, values='Count', names='State', hole=0.4, color='State',
+                             color_discrete_map=state_colors)
+            st.plotly_chart(fig_pie, use_container_width=True)
 
-    st.divider()
-    col_heat, col_growth, col_create = st.columns(3)
-    with col_heat:
-        st.subheader("Consistency Heatmap")
-        if not filtered_revlog.empty:
-            heat_df = filtered_revlog.copy()
-            heat_df['review_date'] = pd.to_datetime(heat_df['review_date'])
-            daily_heat = heat_df.groupby('review_date').size().reset_index(name='reviews')
-            daily_heat['weekday'] = daily_heat['review_date'].dt.weekday
-            daily_heat['week_num'] = daily_heat['review_date'].dt.isocalendar().week
-            daily_heat['year'] = daily_heat['review_date'].dt.isocalendar().year
-            daily_heat['year_week'] = daily_heat['year'].astype(str) + '-W' + daily_heat['week_num'].astype(
-                str).str.zfill(2)
+        st.divider()
+        col_heat, col_growth, col_create = st.columns(3)
+        with col_heat:
+            st.subheader("Consistency Heatmap")
+            if not filtered_revlog.empty:
+                heat_df = filtered_revlog.copy()
+                heat_df['review_date'] = pd.to_datetime(heat_df['review_date'])
+                daily_heat = heat_df.groupby('review_date').size().reset_index(name='reviews')
+                daily_heat['weekday'] = daily_heat['review_date'].dt.weekday
+                daily_heat['week_num'] = daily_heat['review_date'].dt.isocalendar().week
+                daily_heat['year'] = daily_heat['review_date'].dt.isocalendar().year
+                daily_heat['year_week'] = daily_heat['year'].astype(str) + '-W' + daily_heat['week_num'].astype(
+                    str).str.zfill(2)
 
-            pivot_heat = daily_heat.pivot_table(index='weekday', columns='year_week', values='reviews', fill_value=0)
-            pivot_heat = pivot_heat.reindex([0, 1, 2, 3, 4, 5, 6])
-            pivot_heat.index = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+                pivot_heat = daily_heat.pivot_table(index='weekday', columns='year_week', values='reviews', fill_value=0)
+                pivot_heat = pivot_heat.reindex([0, 1, 2, 3, 4, 5, 6])
+                pivot_heat.index = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
-            fig_heat = px.imshow(pivot_heat, color_continuous_scale="Greens", aspect="auto")
-            fig_heat.update_xaxes(showticklabels=False)
-            st.plotly_chart(fig_heat, use_container_width=True)
+                fig_heat = px.imshow(pivot_heat, color_continuous_scale="Greens", aspect="auto")
+                fig_heat.update_xaxes(showticklabels=False)
+                st.plotly_chart(fig_heat, use_container_width=True)
 
-    with col_growth:
-        st.subheader("📈 Learning Growth")
-        if not filtered_revlog.empty:
-            # Calculate when each card was first seen
-            first_seen = filtered_revlog.groupby('cid')['review_date'].min().reset_index()
-            daily_new_seen = first_seen.groupby('review_date').size().reset_index(name='New Seen')
+        with col_growth:
+            st.subheader("📈 Learning Growth")
+            if not filtered_revlog.empty:
+                # Calculate when each card was first seen
+                first_seen = filtered_revlog.groupby('cid')['review_date'].min().reset_index()
+                daily_new_seen = first_seen.groupby('review_date').size().reset_index(name='New Seen')
 
-            fig_seen = px.bar(daily_new_seen, x='review_date', y='New Seen', title="New Cards Seen (First Contact)")
-            fig_seen.update_traces(marker_color="#22c55e")
-            st.plotly_chart(fig_seen, use_container_width=True)
+                fig_seen = px.bar(daily_new_seen, x='review_date', y='New Seen', title="New Cards Seen (First Contact)")
+                fig_seen.update_traces(marker_color="#22c55e")
+                st.plotly_chart(fig_seen, use_container_width=True)
 
-    with col_create:
-        st.subheader("New Cards Added Over Time")
-        if not filtered_cards.empty:
-            new_cards = filtered_cards.groupby('creation_date').size().reset_index(name='cards_added')
-            fig_create = px.line(new_cards, x='creation_date', y='cards_added', markers=True)
-            fig_create.update_traces(line_color="#8b5cf6")
-            st.plotly_chart(fig_create, use_container_width=True)
+        with col_create:
+            st.subheader("New Cards Added Over Time")
+            if not filtered_cards.empty:
+                new_cards = filtered_cards.groupby('creation_date').size().reset_index(name='cards_added')
+                fig_create = px.line(new_cards, x='creation_date', y='cards_added', markers=True)
+                fig_create.update_traces(line_color="#8b5cf6")
+                st.plotly_chart(fig_create, use_container_width=True)
+
+    with subtab3:
+        with st.expander("📈 Longitudinal Memory Trajectory", expanded=True):
+            st.markdown("""
+            ### Memory Trajectory & Knowledge Accumulation
+            This visualizes how my brain is adapting over time by tracking memory depth and accuracy. 
+            * **Cumulative Knowledge (Purple Area):** The total number of unique concepts I've successfully acquired.
+            * **7-Day Retention (Green Line):** My smoothed accuracy. If this drops, I am taking on too much new information too quickly.
+            * **Memory Depth Expansion (Blue Area):** The average spacing interval of my daily reviews. As this climbs, my knowledge is moving from short-term friction into long-term stable memory.
+            """)
+
+            if not filtered_revlog.empty:
+                with st.spinner("Calculating longitudinal memory decay and expansion..."):
+                    from plotly.subplots import make_subplots
+                    import plotly.graph_objects as go
+
+                    # 1. Cumulative Knowledge (Unique Cards Learned)
+                    # Find the first review date for every card to map out when you "acquired" the concept
+                    first_seen = filtered_revlog.groupby('cid')['review_date'].min().reset_index()
+                    daily_new = first_seen.groupby('review_date').size().reset_index(name='new_cards')
+                    daily_new['Cumulative_Knowledge'] = daily_new['new_cards'].cumsum()
+
+                    # 2. Daily Performance & Interval Metrics
+                    daily_stats = filtered_revlog.groupby('review_date').agg(
+                        total_reviews=('id', 'count'),
+                        passed_reviews=('ease', lambda x: (x > 1).sum()),
+                        # Only average the interval of cards that actually have an interval > 0 (ignores learning steps)
+                        avg_ivl=('ivl', lambda x: x[x > 0].mean())
+                    ).reset_index()
+
+                    daily_stats['Retention'] = (daily_stats['passed_reviews'] / daily_stats['total_reviews']) * 100
+
+                    # 3. Merge and Forward Fill
+                    # We merge them so we have a continuous timeline, forward filling cumulative knowledge on rest days
+                    ts_df = pd.merge(daily_stats, daily_new[['review_date', 'Cumulative_Knowledge']], on='review_date',
+                                     how='outer')
+                    ts_df = ts_df.sort_values('review_date')
+                    ts_df['Cumulative_Knowledge'] = ts_df['Cumulative_Knowledge'].ffill().fillna(0)
+
+                    # 4. Exponential Moving Averages (EMA) to smooth the noise
+                    # EMA is better than simple rolling averages here because it reacts faster to recent changes in your study habits
+                    ts_df['EMA_Retention'] = ts_df['Retention'].ewm(span=7, adjust=False).mean()
+                    ts_df['EMA_Ivl'] = ts_df['avg_ivl'].ewm(span=7, adjust=False).mean()
+
+                    # 5. Build the Dual-Layer Plotly Graph
+                    fig_ts = make_subplots(
+                        rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.1,
+                        subplot_titles=(
+                        "Knowledge Acquisition vs. Retention Accuracy", "Memory Depth Expansion (Avg Interval)"),
+                        row_heights=[0.6, 0.4],
+                        specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
+                    )
+
+                    # --- SUBPLOT 1: Knowledge vs Retention ---
+                    fig_ts.add_trace(
+                        go.Scatter(x=ts_df['review_date'], y=ts_df['Cumulative_Knowledge'],
+                                   fill='tozeroy', mode='lines', line=dict(color='rgba(139, 92, 246, 0.6)', width=2),
+                                   name="Total Concepts Learned"),
+                        row=1, col=1, secondary_y=False
+                    )
+
+                    fig_ts.add_trace(
+                        go.Scatter(x=ts_df['review_date'], y=ts_df['EMA_Retention'],
+                                   mode='lines', line=dict(color='#10b981', width=3),
+                                   name="7-Day EMA Retention %"),
+                        row=1, col=1, secondary_y=True
+                    )
+
+                    # --- SUBPLOT 2: Memory Depth (Intervals) ---
+                    fig_ts.add_trace(
+                        go.Scatter(x=ts_df['review_date'], y=ts_df['EMA_Ivl'],
+                                   fill='tozeroy', mode='lines', line=dict(color='rgba(59, 130, 246, 0.7)', width=3),
+                                   name="Avg Memory Depth (Days)"),
+                        row=2, col=1
+                    )
+
+                    # 6. Layout & Formatting Formatting
+                    fig_ts.update_layout(
+                        height=650,
+                        hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1),
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)"
+                    )
+
+                    # Axis stylings
+                    fig_ts.update_yaxes(title_text="Unique Cards", showgrid=True, gridcolor='rgba(150,150,150,0.1)',
+                                        row=1, col=1, secondary_y=False)
+                    fig_ts.update_yaxes(title_text="Retention %", range=[60, 100], showgrid=False, row=1, col=1,
+                                        secondary_y=True)
+                    fig_ts.update_yaxes(title_text="Days in Memory", showgrid=True, gridcolor='rgba(150,150,150,0.1)',
+                                        row=2, col=1)
+
+                    st.plotly_chart(fig_ts, use_container_width=True)
+
+            else:
+                st.info("No review logs found to generate the time series.")
 
 
 
 
 # --- TAB 2: FUTURE WORKLOAD & DECAY ---
 with tab2:
-    col_future1, col_future2 = st.columns(2)
-    today = date.today()
 
-    with col_future1:
-        st.subheader("📅 Workload Forecast")
-        st.markdown(f"Cards actively scheduled for review by Anki leading up to **{exam_date}**.")
-        future_due = filtered_cards[(filtered_cards['due_date'] >= today) & (filtered_cards['due_date'] <= exam_date)]
+    subtab1, subtab2 = st.tabs(["Forecasting", "Predictions"])
 
-        if not future_due.empty:
-            due_counts = future_due.groupby('due_date').size().reset_index(name='cards_due')
-            fig_due = px.bar(due_counts, x='due_date', y='cards_due',
-                             labels={'due_date': 'Date', 'cards_due': 'Cards Due'}, color_discrete_sequence=['#3b82f6'])
-            st.plotly_chart(fig_due, use_container_width=True)
-        else:
-            st.info("No future reviews scheduled in this timeframe.")
+    with subtab1:
+        col_future1, col_future2 = st.columns(2)
+        today = date.today()
 
-    with col_future2:
-        st.subheader("📉 Predicted Memory Decay")
-        st.markdown("The natural decay curve: when the retention of a card falls below 90% if left unreviewed.")
-        future_forgets = filtered_cards[
-            (filtered_cards['forgetting_date'] >= today) & (filtered_cards['forgetting_date'] <= exam_date)]
+        with col_future1:
+            st.subheader("📅 Workload Forecast")
+            st.markdown(f"Cards actively scheduled for review by Anki leading up to **{exam_date}**.")
+            future_due = filtered_cards[(filtered_cards['due_date'] >= today) & (filtered_cards['due_date'] <= exam_date)]
 
-        if not future_forgets.empty:
-            decay_counts = future_forgets.groupby('forgetting_date').size().reset_index(name='cards_decaying')
-            fig_decay = px.area(decay_counts, x='forgetting_date', y='cards_decaying',
-                                labels={'forgetting_date': 'Date', 'cards_decaying': 'Cards Dropping < 90%'},
-                                color_discrete_sequence=['#ef4444'])
-            st.plotly_chart(fig_decay, use_container_width=True)
-        else:
-            st.info("Not enough FSRS review data to project memory decay.")
+            if not future_due.empty:
+                due_counts = future_due.groupby('due_date').size().reset_index(name='cards_due')
+                fig_due = px.bar(due_counts, x='due_date', y='cards_due',
+                                 labels={'due_date': 'Date', 'cards_due': 'Cards Due'}, color_discrete_sequence=['#3b82f6'])
+                st.plotly_chart(fig_due, use_container_width=True)
+            else:
+                st.info("No future reviews scheduled in this timeframe.")
 
-    st.divider()
-    st.subheader("FSRS Memory State: Difficulty vs. Stability")
-    fsrs_plot_df = filtered_cards.dropna(subset=['d', 's', 'card_front'])
-    if not fsrs_plot_df.empty:
-        fig_scatter = px.scatter(
-            fsrs_plot_df, x='d', y='s', hover_data=['clean_text', 'lapses', 'reps'],
-            color='deck_name' if selected_deck == "All Decks" else None, opacity=0.6,
-            labels={'d': 'Difficulty (1-10)', 's': 'Stability (Days until forgotten)'}
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        with col_future2:
+            st.subheader("📉 Predicted Memory Decay")
+            st.markdown("The natural decay curve: when the retention of a card falls below 90% if left unreviewed.")
+            future_forgets = filtered_cards[
+                (filtered_cards['forgetting_date'] >= today) & (filtered_cards['forgetting_date'] <= exam_date)]
+
+            if not future_forgets.empty:
+                decay_counts = future_forgets.groupby('forgetting_date').size().reset_index(name='cards_decaying')
+                fig_decay = px.area(decay_counts, x='forgetting_date', y='cards_decaying',
+                                    labels={'forgetting_date': 'Date', 'cards_decaying': 'Cards Dropping < 90%'},
+                                    color_discrete_sequence=['#ef4444'])
+                st.plotly_chart(fig_decay, use_container_width=True)
+            else:
+                st.info("Not enough FSRS review data to project memory decay.")
+
+        st.divider()
+        st.subheader("FSRS Memory State: Difficulty vs. Stability")
+        fsrs_plot_df = filtered_cards.dropna(subset=['d', 's', 'card_front'])
+        if not fsrs_plot_df.empty:
+            fig_scatter = px.scatter(
+                fsrs_plot_df, x='d', y='s', hover_data=['clean_text', 'lapses', 'reps'],
+                color='deck_name' if selected_deck == "All Decks" else None, opacity=0.6,
+                labels={'d': 'Difficulty (1-10)', 's': 'Stability (Days until forgotten)'}
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+    with subtab2:
+        with st.expander("The Neural Oracle", expanded=True):
+            st.markdown("""
+            ### The Neural Oracle
+            This module uses **Dense Semantic Embeddings** and **Gradient Boosting** to predict cognitive friction.
+            * **The Regressor:** Predicts the fundamental Difficulty ($D$) of Unseen cards.
+            * **The Classifier:** Analyzes cards due soon and predicts my probability of lapsing (failing) based on my historical semantic weaknesses.
+            """)
+
+
+            # 1. Prepare the Core Data
+            # We need the embedder you already loaded in Tab 6
+            @st.cache_resource
+            def load_embedder():
+                from sentence_transformers import SentenceTransformer
+                return SentenceTransformer('all-MiniLM-L6-v2')
+
+
+            embedder = load_embedder()
+
+
+            def clean_for_embeddings(text, tags):
+                raw = f"{text} {tags}".replace('_', ' ')
+                return re.sub(r'[^\w\s]', ' ', str(raw).lower())
+
+
+            # Safely prepare the dataframe
+            ml_df = filtered_cards.copy()
+            ml_df['nlp_ready'] = ml_df.apply(lambda x: clean_for_embeddings(x['clean_text'], x['tags']), axis=1)
+
+            if len(ml_df[ml_df['knowledge_state'] != 'Unseen']) > 50:
+                with st.spinner("Generating dense 384-D semantic embeddings and training Gradient Boosting trees..."):
+                    from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
+                    from sklearn.inspection import permutation_importance
+                    import numpy as np
+
+                    # --- MODEL 1: THE FRICTION REGRESSOR (For Unseen Cards) ---
+                    st.subheader("🌋 The Horizon: Unseen Difficulty Predictions")
+
+                    # Split data
+                    train_reg = ml_df[(ml_df['knowledge_state'] != 'Unseen') & (ml_df['d'].notna())].copy()
+                    target_reg = ml_df[ml_df['knowledge_state'] == 'Unseen'].copy()
+
+                    if not target_reg.empty:
+                        # Generate Embeddings (X)
+                        X_train_emb = embedder.encode(train_reg['nlp_ready'].tolist(), show_progress_bar=False)
+                        X_target_emb = embedder.encode(target_reg['nlp_ready'].tolist(), show_progress_bar=False)
+
+                        y_train_reg = train_reg['d']
+
+                        # Train Gradient Boosting Regressor
+                        gbr = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.1, random_state=42)
+                        gbr.fit(X_train_emb, y_train_reg)
+
+                        # Predict
+                        target_reg['Predicted_Difficulty'] = gbr.predict(X_target_emb)
+
+                        # Display Top Threats
+                        threats = target_reg[['clean_text', 'deck_name', 'Predicted_Difficulty', 'tags']].sort_values(
+                            by='Predicted_Difficulty', ascending=False
+                        ).rename(columns={'clean_text':           'Card Text', 'deck_name': 'Deck',
+                                          'Predicted_Difficulty': 'Predicted Friction'})
+
+                        st.markdown(
+                            "These **Unseen** cards have semantic profiles matching my most difficult historical concepts.")
+                        st.dataframe(
+                            threats.head(50).style.background_gradient(subset=['Predicted Friction'], cmap='Reds',
+                                                                       vmin=1,
+                                                                       vmax=10).format(
+                                {'Predicted Friction': "{:.1f}"}),
+                            use_container_width=True, hide_index=True
+                        )
+                    else:
+                        st.success("No Unseen cards left! The Horizon is clear.")
+
+                    # --- MODEL 2: THE LAPSE CLASSIFIER (For Due Cards) ---
+                    st.divider()
+                    st.subheader("⚠️ Imminent Lapses: High-Risk Due Cards")
+
+                    # We define a "Struggling" card as one with a historical lapse rate > 15% AND low stability
+                    train_clf = ml_df[ml_df['reps'] > 2].copy()
+                    train_clf['failure_rate'] = train_clf['lapses'] / train_clf['reps']
+
+                    # Target: 1 if it's a high-risk card, 0 otherwise
+                    train_clf['is_high_risk'] = ((train_clf['failure_rate'] > 0.15) & (train_clf['s'] < 14)).astype(int)
+
+                    # We only want to predict on cards that are actually Due in the next 3 days
+                    future_3_days = date.today() + timedelta(days=3)
+                    due_target = ml_df[(ml_df['due_date'].notna()) & (ml_df['due_date'] <= future_3_days) & (
+                            ml_df['knowledge_state'] != 'Unseen')].copy()
+
+                    if not due_target.empty and train_clf['is_high_risk'].sum() > 10:
+                        # Feature Engineering for Classifier: Embeddings + FSRS State
+                        # We stack the dense embeddings with the current FSRS metrics
+                        X_clf_emb = embedder.encode(train_clf['nlp_ready'].tolist(), show_progress_bar=False)
+                        X_clf_fsrs = train_clf[['d', 's', 'ivl']].fillna(0).values
+                        X_train_clf = np.hstack((X_clf_emb, X_clf_fsrs))
+
+                        y_train_clf = train_clf['is_high_risk']
+
+                        # Train Gradient Boosting Classifier
+                        gbc = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.05, class_weight='balanced',
+                                                             random_state=42)
+                        gbc.fit(X_train_clf, y_train_clf)
+
+                        # Prepare Target Data
+                        X_due_emb = embedder.encode(due_target['nlp_ready'].tolist(), show_progress_bar=False)
+                        X_due_fsrs = due_target[['d', 's', 'ivl']].fillna(0).values
+                        X_target_clf = np.hstack((X_due_emb, X_due_fsrs))
+
+                        # Predict Probability of being a High-Risk Lapse
+                        probs = gbc.predict_proba(X_target_clf)[:, 1] * 100
+                        due_target['Lapse_Probability'] = probs
+
+
+                        # Calculate current FSRS Retrievability (R)
+                        # Formula: R = 0.9 ^ (t / S)
+                        def calc_retrievability(row):
+                            if pd.isna(row['last_review_datetime']) or pd.isna(row['s']) or row['s'] <= 0:
+                                return 100.0
+                            days_since = (date.today() - row['last_review_datetime'].date()).days
+                            r = (0.9 ** (days_since / row['s'])) * 100
+                            return max(0.0, min(100.0, r))
+
+
+                        due_target['Current_Recall_Prob'] = due_target.apply(calc_retrievability, axis=1)
+
+                        # Filter and sort by the highest machine-learning predicted lapse risk
+                        lapses = due_target[due_target['Lapse_Probability'] > 50].sort_values('Lapse_Probability',
+                                                                                              ascending=False)
+
+                        if not lapses.empty:
+                            st.markdown(
+                                f"The Neural Oracle has flagged **{len(lapses)} cards** due soon that have a highly toxic mix of semantic complexity and low stability.")
+
+                            lapse_display = lapses[
+                                ['clean_text', 'due_date', 'Lapse_Probability', 'Current_Recall_Prob', 'd']].rename(
+                                columns={
+                                    'clean_text':        'Card Text', 'due_date': 'Due Date',
+                                    'Lapse_Probability': 'AI Lapse Risk (%)', 'Current_Recall_Prob': 'FSRS Recall (%)',
+                                    'd':                 'Friction'
+                                })
+
+                            st.dataframe(
+                                lapse_display.head(50).style.background_gradient(subset=['AI Lapse Risk (%)'],
+                                                                                 cmap='Oranges', vmin=50, vmax=100)
+                                .background_gradient(subset=['FSRS Recall (%)'], cmap='RdYlGn', vmin=70, vmax=100)
+                                .format(
+                                    {'AI Lapse Risk (%)': "{:.1f}%", 'FSRS Recall (%)': "{:.1f}%",
+                                     'Friction':          "{:.1f}"}),
+                                use_container_width=True, hide_index=True
+                            )
+                        else:
+                            st.success("My due cards look remarkably stable. The Oracle predicts no major lapses!")
+                    else:
+                        st.info("Not enough historical lapse data or upcoming due cards to run the classifier.")
+
+            else:
+                st.warning(
+                    "I need to review at least 50 cards before the Neural Oracle has enough data to model Lukas' brain.")
 
 # --- TAB 3: STUDY OPTIMIZATION ---
 with tab3:
@@ -784,144 +1066,163 @@ with mapping:
         else:
             st.info("You need at least 30 cards to generate this map.")
 
-
     with subtab_Meta:
         st.markdown("""
-        This map synthesizes every data point Anki and FSRS have on your learning behavior.
-        * **Vertical Position (Z):** Stability (Memory Depth) — Higher is better!
-        * **Color:** Difficulty (Red = Hardest, Green = Mastered)
-        * **Size:** Lapses (Conceptual friction/failures)
-        * **Text Labels:** Automated "signature concept" for high-risk cards
+        ### FSRS Principal Component Analysis (PCA) & Clustering
+        This map uses **PCA** to reduce your raw FSRS stats down to 3 core dimensions. 
+        Instead of a black-box AI algorithm, PCA creates linear axes that mathematically explain the most variance in your study habits. 
         """)
 
-        # 1. Define Heuristics and filter for available data
-        base_heuristics = ['d', 's', 'ivl', 'lapses', 'reps', 'r']
-        available_h = [h for h in base_heuristics if h in filtered_cards.columns]
+        # 1. Define FSRS features
+        fsrs_features = ['d', 's', 'lapses', 'reps', 'ivl']
+        available_f = [f for f in fsrs_features if f in filtered_cards.columns]
 
-        # Create a copy focused on cards with core FSRS data
-        strat_df = filtered_cards.dropna(subset=['d', 's']).copy()
+        pca_df = filtered_cards.dropna(subset=['d', 's']).copy()
 
-        if len(strat_df) > 15:
-            with st.spinner("Crunching behavioral heuristics and semantic labels..."):
+        if len(pca_df) > 15 and len(available_f) >= 3:
+            with st.spinner("Running PCA and K-Means on FSRS attributes..."):
+                from sklearn.preprocessing import StandardScaler
+                from sklearn.decomposition import PCA
+                from sklearn.cluster import KMeans
 
-                # 2. Impute missing values with medians for robustness
-                for h in available_h:
-                    median_val = strat_df[h].median()
-                    if pd.isna(median_val):
-                        # Use mathematical defaults if a column is totally empty
-                        default = 0.9 if h == 'r' else 0
-                        strat_df[h] = strat_df[h].fillna(default)
+                # 2. Impute and Scale
+                for f in available_f:
+                    median_val = pca_df[f].median()
+                    pca_df[f] = pca_df[f].fillna(median_val if not pd.isna(median_val) else 0)
+
+                final_pca_df = pca_df.dropna(subset=available_f).copy()
+                scaler = StandardScaler()
+                fsrs_scaled = scaler.fit_transform(final_pca_df[available_f])
+
+                # 3. Apply PCA (3 Components)
+                pca = PCA(n_components=3)
+                pca_coords = pca.fit_transform(fsrs_scaled)
+
+                final_pca_df['PC1'] = pca_coords[:, 0]
+                final_pca_df['PC2'] = pca_coords[:, 1]
+                final_pca_df['PC3'] = pca_coords[:, 2]
+
+                # 4. K-Means Clustering on the Scaled Data
+                n_clusters = min(5, len(final_pca_df))
+                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+                final_pca_df['Cluster_ID'] = kmeans.fit_predict(fsrs_scaled)
+
+                # 5. Interpret Clusters (Generate Names based on actual centroids)
+                # We inverse_transform the centers back to raw FSRS values so they make sense
+                centers_raw = pd.DataFrame(scaler.inverse_transform(kmeans.cluster_centers_), columns=available_f)
+                cluster_names = {}
+
+                avg_lapses = final_pca_df['lapses'].mean()
+                avg_reps = final_pca_df['reps'].mean()
+
+                for i, row in centers_raw.iterrows():
+                    if row.get('lapses', 0) > max(avg_lapses * 1.5, 2):
+                        cluster_names[i] = "🛑 High-Lapse Leeches"
+                    elif row.get('d', 0) > 7.5 and row.get('s', 0) < 14:
+                        cluster_names[i] = "⚠️ High Friction / Unstable"
+                    elif row.get('s', 0) > 30 and row.get('d', 0) < 5:
+                        cluster_names[i] = "💎 Mastered & Easy"
+                    elif row.get('reps', 0) > avg_reps * 1.5:
+                        cluster_names[i] = "🐢 Heavy Grind"
                     else:
-                        strat_df[h] = strat_df[h].fillna(median_val)
+                        cluster_names[i] = "⚡ Average / Core"
 
-                # 3. Final safety cleanup
-                final_df = strat_df.dropna(subset=available_h).copy()
+                final_pca_df['FSRS_Profile'] = final_pca_df['Cluster_ID'].map(cluster_names)
 
-                if len(final_df) > 10:
-                    from sklearn.preprocessing import StandardScaler
-
-                    scaler = StandardScaler()
-                    strat_scaled = scaler.fit_transform(final_df[available_h])
-
-                    # 4. 3D t-SNE Projection (PCA Init for stability)
-                    tsne_all = TSNE(
-                        n_components=3,
-                        perplexity=min(30, len(final_df) - 1),
-                        random_state=42,
-                        init='pca',
-                        learning_rate='auto'
-                    )
-                    strat_coords = tsne_all.fit_transform(strat_scaled)
-                    final_df['HX'], final_df['HY'], final_df['HZ'] = strat_coords[:, 0], strat_coords[:,
-                                                                                         1], strat_coords[:,
-                                                                                             2]
-
-                    # 5. K-Means Behavioral Clustering
-                    n_meta_clusters = min(5, len(final_df))
-                    km_meta = KMeans(n_clusters=n_meta_clusters, random_state=42, n_init='auto')
-                    final_df['meta_cluster'] = km_meta.fit_predict(strat_scaled)
-
-                    # 6. Strategic Labeling based on behavioral patterns
-                    centers = final_df.groupby('meta_cluster')[available_h].mean()
-                    meta_labels = {}
-                    avg_lapses = final_df['lapses'].mean()
-
-                    for i, row in centers.iterrows():
-                        if row.get('lapses', 0) > avg_lapses * 1.5:
-                            meta_labels[i] = "🛑 THE LEECH PIT"
-                        elif row['d'] > 7.5 and row['s'] < 10:
-                            meta_labels[i] = "⚠️ HIGH-FRICTION ZONE"
-                        elif row['s'] > 45:
-                            meta_labels[i] = "💎 LONG-TERM ASSETS"
-                        elif row.get('r', 1) < 0.88:
-                            meta_labels[i] = "📉 URGENT DECAY"
-                        else:
-                            meta_labels[i] = "⚡ STEADY PROGRESS"
-
-                    final_df['Behavioral_Group'] = final_df['meta_cluster'].map(meta_labels)
+                # 6. Extract PCA Loadings to dynamically name the axes
+                loadings = pd.DataFrame(pca.components_.T, columns=['PC1', 'PC2', 'PC3'], index=available_f)
 
 
-                    # 7. Semantic Label Extraction per point
-                    def get_point_concept(text, tags):
-                        raw = f"{text} {tags}"
-                        # Use a regex to strip numbers and dates
-                        text_no_nums = re.sub(r'\d+', '', str(raw).lower())
-                        tokens = re.split(r'[ _]', re.sub(r'[^\w\s]', ' ', text_no_nums))
-                        clean = [t for t in tokens if len(t) > 3 and t not in all_stops]
-                        return max(clean, key=len).upper() if clean else "MISC"
+                def get_axis_label(pc_col):
+                    # Find the FSRS metric that pulls the hardest on this axis
+                    top_feature = loadings[pc_col].abs().idxmax()
+                    direction = "+" if loadings.loc[top_feature, pc_col] > 0 else "-"
+                    return f"{pc_col} (Driven by {direction}{top_feature.upper()})"
 
 
-                    final_df['Concept'] = final_df.apply(lambda x: get_point_concept(x['clean_text'], x['tags']),
-                                                         axis=1)
+                ax_x = get_axis_label('PC1')
+                ax_y = get_axis_label('PC2')
+                ax_z = get_axis_label('PC3')
 
-                    # 8. The 3D Strategy Plot
-                    fig_all = px.scatter_3d(
-                        final_df, x='HX', y='HY', z='s',
-                        color='d', size='lapses',
-                        symbol='Behavioral_Group',
-                        hover_name='Concept',
-                        hover_data={
-                            'clean_text': True,
-                            'deck_name':  True,
-                            'd':          True,
-                            's':          ':.1f',
-                            'lapses':     True,
-                            'HX':         False, 'HY': False
-                        },
-                        opacity=0.8, height=850,
-                        color_continuous_scale='RdYlGn_r'
-                    )
 
-                    # Overlay text labels for 'Danger' clusters to highlight friction
-                    danger_groups = ["🛑 THE LEECH PIT", "⚠️ HIGH-FRICTION ZONE"]
-                    danger_df = final_df[final_df['Behavioral_Group'].isin(danger_groups)]
-                    if not danger_df.empty:
-                        fig_all.add_trace(go.Scatter3d(
-                            x=danger_df['HX'], y=danger_df['HY'], z=danger_df['s'],
-                            mode='text',
-                            text=danger_df['Concept'],
-                            textfont=dict(size=10, color="white"),
-                            showlegend=False
-                        ))
+                # 7. Semantic Extraction for the hover tooltip
+                def get_point_concept(text, tags):
+                    raw = f"{text} {tags}"
+                    text_no_nums = re.sub(r'\d+', '', str(raw).lower())
+                    tokens = re.split(r'[ _]', re.sub(r'[^\w\s]', ' ', text_no_nums))
+                    clean = [t for t in tokens if len(t) > 3 and t not in GLOBAL_STOP_WORDS]
+                    return max(clean, key=len).upper() if clean else "MISC"
 
-                    fig_all.update_layout(scene=dict(
-                        xaxis=dict(showticklabels=False, title='Behavioral Context X'),
-                        yaxis=dict(showticklabels=False, title='Behavioral Context Y'),
-                        zaxis_title='Memory Stability (Days)'
-                    ))
-                    st.plotly_chart(fig_all, use_container_width=True)
 
-                    # 9. Cluster Statistics Summary
-                    st.subheader("📋 Behavioral Performance Summary")
-                    readable_centers = centers.copy()
-                    readable_centers.index = [meta_labels.get(i, f"Group {i}") for i in readable_centers.index]
-                    st.dataframe(readable_centers.sort_values('d', ascending=False), use_container_width=True)
+                final_pca_df['Concept'] = final_pca_df.apply(lambda x: get_point_concept(x['clean_text'], x['tags']),
+                                                             axis=1)
 
-                else:
-                    st.warning("Not enough clean data left for this operation.")
+                # 8. Render the 3D PCA Plot
+                fig_pca = px.scatter_3d(
+                    final_pca_df, x='PC1', y='PC2', z='PC3',
+                    color='FSRS_Profile',
+                    size='d',  # Scale node size by Difficulty
+                    hover_name='Concept',
+                    hover_data={
+                        'clean_text': True,
+                        'deck_name':  True,
+                        'd':          ':.1f',
+                        's':          ':.1f',
+                        'lapses':     True,
+                        'reps':       True,
+                        'ivl':        True,
+                        'PC1':        False, 'PC2': False, 'PC3': False, 'Cluster_ID': False
+                    },
+                    opacity=0.85, height=800,
+                    color_discrete_sequence=px.colors.qualitative.Bold
+                )
+
+                fig_pca.update_layout(
+                    scene=dict(
+                        xaxis_title=ax_x,
+                        yaxis_title=ax_y,
+                        zaxis_title=ax_z
+                    ),
+                    legend=dict(title='FSRS Archetype', yanchor="top", y=0.99, xanchor="left", x=0.01)
+                )
+
+                # Minimum size to ensure easy cards don't vanish
+                fig_pca.update_traces(marker=dict(sizemin=3, line=dict(width=0.5, color='DarkSlateGrey')))
+
+                st.plotly_chart(fig_pca, use_container_width=True)
+
+                st.divider()
+
+                # 9. Explained Variance & Loadings Matrix Output
+                col_exp, col_load = st.columns([1, 2])
+                with col_exp:
+                    st.subheader("📊 Explained Variance")
+                    st.markdown("How much of your total learning history is captured by each axis.")
+                    var_df = pd.DataFrame({
+                        'Principal Component': ['PC1', 'PC2', 'PC3'],
+                        'Variance Explained':  pca.explained_variance_ratio_ * 100
+                    })
+                    fig_var = px.bar(var_df, x='Principal Component', y='Variance Explained', text_auto=':.1f')
+                    fig_var.update_traces(textposition='outside')
+                    fig_var.update_layout(yaxis_title="% Variance Explained", height=300)
+                    st.plotly_chart(fig_var, use_container_width=True)
+
+                with col_load:
+                    st.subheader("🧠 Component Loadings")
+                    st.markdown(
+                        "Values further from zero mean that FSRS attribute strongly pulls the card along that axis.")
+                    # Color format the dataframe for easy reading
+                    st.dataframe(loadings.style.background_gradient(cmap='RdBu', vmin=-1, vmax=1),
+                                 use_container_width=True)
+
+                # 10. Show Raw Cluster Centroids
+                st.subheader("📋 FSRS Cluster Profiles (Averages)")
+                centers_raw.index = [cluster_names.get(i, f"Cluster {i}") for i in centers_raw.index]
+                st.dataframe(centers_raw.sort_values('d', ascending=False).style.format("{:.2f}"),
+                             use_container_width=True)
+
         else:
-            st.info("Insufficient FSRS history to generate this map. Keep reviewing!")
-
+            st.info("Not enough FSRS parameters to run PCA. Keep studying!")
 
 # --- TAB 7: MASTER READINESS & CALIBRATION ---
 # --- TAB 7: MASTER READINESS & CALIBRATION ---
@@ -1345,3 +1646,5 @@ with tab9:
                         st.caption(r)
             else:
                 st.info("The hall is empty. Check the Bounty Board to earn your first gold!")
+
+
