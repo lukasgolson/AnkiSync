@@ -1,5 +1,4 @@
 import json
-import random
 import re
 from datetime import date, timedelta
 
@@ -8,12 +7,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
-from sklearn.cluster import KMeans
-from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.manifold import TSNE
 from supabase import create_client
+import pytz
 
+from datetime import datetime
+
+def get_local_today():
+    """Always returns the current date in Vancouver, regardless of server location."""
+    return datetime.now(pytz.timezone('America/Vancouver')).date()
 
 GLOBAL_STOP_WORDS = set([
     'this', 'that', 'with', 'from', 'what', 'which', 'where', 'when', 'how', 'have',
@@ -79,7 +81,11 @@ def load_data():
     revlog = fetch_all('revlog')
 
     if not revlog.empty:
-        revlog['review_datetime'] = pd.to_datetime(revlog['id'], unit='ms')
+        # 1. Localize epoch to UTC, then convert to Vancouver time
+        vancouver_tz = pytz.timezone('America/Vancouver')
+        revlog['review_datetime'] = pd.to_datetime(revlog['id'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(
+            vancouver_tz)
+
         revlog['review_date'] = revlog['review_datetime'].dt.date
         revlog['hour'] = revlog['review_datetime'].dt.hour
         ease_map = {1: 'Again', 2: 'Hard', 3: 'Good', 4: 'Easy'}
@@ -108,7 +114,9 @@ def load_data():
         cards['s'] = pd.to_numeric(cards['s'], errors='coerce')
         cards['d'] = pd.to_numeric(cards['d'], errors='coerce')
 
-        cards['creation_date'] = pd.to_datetime(cards['id'], unit='ms').dt.date
+        vancouver_tz = pytz.timezone('America/Vancouver')
+        cards['creation_date'] = pd.to_datetime(cards['id'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(
+            vancouver_tz).dt.date
 
         cards = cards.merge(decks.rename(columns={'id': 'did', 'name': 'deck_name'}), on='did', how='left')
         cards = cards.merge(notes.rename(columns={'id': 'nid', 'sfld': 'card_front', 'tags': 'tags'}), on='nid',
@@ -177,7 +185,7 @@ def calculate_rpg_state(cards_df, revlog_df, db_stats):
         # type == 1 means the card was in the "Review" phase.
         # ease == 1 means you hit "Again".
         today_demotions = len(revlog_df[
-                                  (revlog_df['review_date'] == date.today()) &
+                                  (revlog_df['review_date'] == get_local_today()) &
                                   (revlog_df['ease'] == 1) &
                                   (revlog_df['type'] == 1)
                                   ])
@@ -210,11 +218,11 @@ if cards_df.empty or revlog_df.empty:
 # SIDEBAR FILTERS & EXAM COUNTDOWN
 # ==========================================
 st.sidebar.header("🎯 Target")
-exam_date = date(date.today().year, 4, 14)
-if date.today() > exam_date:
-    exam_date = date(date.today().year + 1, 4, 14)
+exam_date = date(get_local_today().year, 4, 14)
+if get_local_today() > exam_date:
+    exam_date = date(get_local_today().year + 1, 4, 14)
 
-days_left = (exam_date - date.today()).days
+days_left = (exam_date - get_local_today()).days
 st.sidebar.metric("Days Until Exam (Apr 14)", f"{days_left} Days")
 st.sidebar.divider()
 
@@ -278,7 +286,7 @@ if not filtered_revlog.empty:
     daily_totals = daily_totals.sort_values('review_date', ascending=False)
 
     streak = 0
-    check_date = date.today()
+    check_date = get_local_today()
     if check_date not in daily_totals['review_date'].values:
         check_date = check_date - timedelta(days=1)
 
@@ -295,8 +303,8 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, mapping, tab7, tab9, tab10 = st.tabs([
-    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness", "Game", "Oracle"
+tab1, tab2, tab3, tab4, mapping, tab7, tab9 = st.tabs([
+    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness", "Game"
 ])
 
 # --- TAB 1: OVERVIEW ---
@@ -502,7 +510,7 @@ with tab2:
 
     with subtab1:
         col_future1, col_future2 = st.columns(2)
-        today = date.today()
+        today = get_local_today()
 
         with col_future1:
             st.subheader("📅 Workload Forecast")
@@ -576,7 +584,6 @@ with tab2:
             if len(ml_df[ml_df['knowledge_state'] != 'Unseen']) > 50:
                 with st.spinner("Generating dense 384-D semantic embeddings and training Gradient Boosting trees..."):
                     from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
-                    from sklearn.inspection import permutation_importance
                     import numpy as np
 
                     # --- MODEL 1: THE FRICTION REGRESSOR (For Unseen Cards) ---
@@ -630,7 +637,7 @@ with tab2:
                     train_clf['is_high_risk'] = ((train_clf['failure_rate'] > 0.15) & (train_clf['s'] < 14)).astype(int)
 
                     # We only want to predict on cards that are actually Due in the next 3 days
-                    future_3_days = date.today() + timedelta(days=3)
+                    future_3_days = get_local_today() + timedelta(days=3)
                     due_target = ml_df[(ml_df['due_date'].notna()) & (ml_df['due_date'] <= future_3_days) & (
                             ml_df['knowledge_state'] != 'Unseen')].copy()
 
@@ -663,7 +670,7 @@ with tab2:
                         def calc_retrievability(row):
                             if pd.isna(row['last_review_datetime']) or pd.isna(row['s']) or row['s'] <= 0:
                                 return 100.0
-                            days_since = (date.today() - row['last_review_datetime'].date()).days
+                            days_since = (get_local_today() - row['last_review_datetime'].date()).days
                             r = (0.9 ** (days_since / row['s'])) * 100
                             return max(0.0, min(100.0, r))
 
@@ -735,7 +742,7 @@ with tab3:
         st.subheader("🎯 Button Bias & Session Stats")
         # Calculate session time estimate
         avg_speed = filtered_revlog['time'].mean() / 1000  # seconds
-        cards_today = len(filtered_cards[filtered_cards['due_date'] == date.today()])
+        cards_today = len(filtered_cards[filtered_cards['due_date'] == get_local_today()])
         est_minutes = (cards_today * avg_speed) / 60
 
         st.metric("Est. Time to Clear Today", f"{est_minutes:.1f} Mins", help="Based on your historical speed")
@@ -882,7 +889,44 @@ with mapping:
         custom_neighbors = st.sidebar.slider("Map Detail (Neighbors)", 5, 50, 15)
         edge_threshold = st.sidebar.slider("Web Threshold (Similarity)", 0.60, 0.95, 0.75, 0.01)
 
-        map_df = filtered_cards.dropna(subset=['clean_text', 'd']).copy()
+        # CHANGE 1: Drop only cards without text. Keep Unseen cards!
+        map_df = filtered_cards.dropna(subset=['clean_text']).copy()
+
+        # Fill missing FSRS data with 0s so Plotly hover text doesn't crash on Unseen cards
+        map_df['d'] = map_df['d'].fillna(0)
+        map_df['s'] = map_df['s'].fillna(0)
+        map_df['lapses'] = map_df['lapses'].fillna(0)
+
+
+        # CHANGE 2: Define your 5-Tier Mastery Logic
+        def assign_mastery(row):
+            state = row.get('knowledge_state', 'Unseen')
+            s = row['s']
+            d = row['d']
+            lapses = row['lapses']
+
+            if state == 'Unseen':
+                return 'Not Known'
+            elif lapses >= 2 and s < 10:
+                return 'Danger'
+            elif d > 7.5 or (state == 'Seen' and s < 7):
+                return 'Problematic'
+            elif s >= 21 or state == 'Known':
+                return 'Mastered'
+            else:
+                return 'Known'
+
+
+        map_df['Mastery_Zone'] = map_df.apply(assign_mastery, axis=1)
+
+        # Hex codes for your exact requested color scheme
+        mastery_colors = {
+            'Mastered':    '#14532d',  # Dark Green
+            'Known':       '#4ade80',  # Light Green
+            'Problematic': '#f97316',  # Orange
+            'Danger':      '#ef4444',  # Red
+            'Not Known':   '#7f1d1d'  # Deep Red
+        }
 
         if len(map_df) > 30:
             with st.spinner("Generating dense semantic embeddings and mapping the knowledge space..."):
@@ -993,16 +1037,25 @@ with mapping:
                             edge_z.extend([map_df['Map Z'].iloc[i], map_df['Map Z'].iloc[j], None])
 
                 # 9. Final 3D Plot Assembly
-                fig_map = px.scatter_3d(
-                    map_df, x='Map X', y='Map Y', z='Map Z',
-                    color='d', color_continuous_scale='Turbo',
-                    hover_name='deck_name',
-                    hover_data={
-                        'Map X':      False, 'Map Y': False, 'Map Z': False,
-                        'clean_text': True, 'd': True, 'cluster': True
-                    },
-                    opacity=0.9, height=800
-                )
+                            # 9. Final 3D Plot Assembly
+                            fig_map = px.scatter_3d(
+                                map_df, x='Map X', y='Map Y', z='Map Z',
+                                color='Mastery_Zone',
+                                color_discrete_map=mastery_colors,
+                                category_orders={
+                                    "Mastery_Zone": ["Mastered", "Known", "Problematic", "Danger", "Not Known"]},
+                                # Forces legend order
+                                hover_name='deck_name',
+                                hover_data={
+                                    'Map X':        False, 'Map Y': False, 'Map Z': False,
+                                    'clean_text':   True,
+                                    'Mastery_Zone': True,
+                                    'd':            ':.1f',
+                                    's':            ':.1f',
+                                    'cluster':      True
+                                },
+                                opacity=0.9, height=800
+                            )
 
                 # Add the Web Layer (Lines)
                 fig_map.add_trace(go.Scatter3d(
@@ -1413,7 +1466,7 @@ with tab9:
             with st.container(border=True):
                 st.subheader("📜 Daily Bounty Board")
 
-                today_str = str(date.today())
+                today_str = str(get_local_today())
                 bounties = db_stats['claimed_bounties']
 
                 if bounties.get('date') != today_str:
@@ -1426,9 +1479,9 @@ with tab9:
                 scribe_goal = max(20, min(100, cards_due_today))
                 explorer_goal = max(5, min(25, int(unseen_remaining * 0.05)))
 
-                today_revs = filtered_revlog[filtered_revlog['review_date'] == date.today()]
+                today_revs = filtered_revlog[filtered_revlog['review_date'] == get_local_today()]
                 today_count = len(today_revs)
-                today_new = len(filtered_cards[filtered_cards['creation_date'] == date.today()])
+                today_new = len(filtered_cards[filtered_cards['creation_date'] == get_local_today()])
 
 
                 # OPTIMISTIC UPDATE FUNCTION
@@ -1523,7 +1576,7 @@ with tab9:
     # SUB-TAB 2: THE ARMORY (DAILY SHOP)
     # ==========================================
     with subtab_armory:
-        today_seed = date.today().toordinal()
+        today_seed = get_local_today().toordinal()
         random.seed(today_seed)
 
 
@@ -1569,7 +1622,7 @@ with tab9:
             relic_item = f"🕯️ {r_concept} Lantern"
 
         with st.container(border=True):
-            st.subheader(f"🛒 The Daily Merchant ({date.today().strftime('%b %d')})")
+            st.subheader(f"🛒 The Daily Merchant ({get_local_today().strftime('%b %d')})")
             st.markdown(f"**Available Gold:** 💰 {current_gold}")
 
             col_s1, col_s2, col_s3 = st.columns(3)
