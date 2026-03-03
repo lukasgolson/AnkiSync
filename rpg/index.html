@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lukas FSRS Brainagotchi</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-200 p-4 md:p-8 font-sans min-h-screen">
+
+    <div class="max-w-6xl mx-auto space-y-6">
+
+        <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-2xl flex flex-col md:flex-row justify-between items-center gap-4">
+            <div>
+                <h1 class="text-3xl font-bold text-white mb-1">🛡️ Scholar Level <span id="char-level" class="text-purple-400">...</span></h1>
+                <p class="text-slate-400">Total Experience: <span id="char-xp" class="font-mono text-white">...</span> XP</p>
+                <p class="text-xs text-slate-500 mt-2">Engine Last Synced: <span id="last-sync">...</span></p>
+            </div>
+            <div class="text-right">
+                <p class="text-sm text-slate-400 uppercase tracking-widest mb-1">Treasury</p>
+                <p class="text-5xl font-black text-yellow-400 drop-shadow-md">💰 <span id="char-gold">...</span></p>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl flex flex-col items-center">
+                <h2 class="text-xl font-bold text-white mb-4 w-full text-left uppercase tracking-wider">📊 Neural Attributes</h2>
+                <div class="w-full max-w-[250px] mt-4">
+                    <canvas id="radarChart"></canvas>
+                </div>
+            </div>
+
+            <div class="bg-slate-800 p-6 rounded-xl border-4 border-slate-600 shadow-xl col-span-1 lg:col-span-2 relative overflow-hidden flex flex-col md:flex-row items-center gap-8 font-mono">
+
+                <div class="bg-emerald-900 w-full max-w-sm rounded-lg border-8 border-slate-700 p-6 flex flex-col items-center shadow-inner relative flex-shrink-0">
+                    <div class="absolute top-2 left-2 flex gap-2">
+                        <span class="text-emerald-500 text-xs">STREAK <span id="pet-level">...</span></span>
+                    </div>
+
+                    <div id="pet-sprite" class="text-8xl animate-bounce my-4 drop-shadow-lg transition-all">
+                        🥚
+                    </div>
+
+                    <h3 id="pet-stage" class="text-emerald-300 text-xl font-bold mt-2 text-center">...</h3>
+                    <p class="text-emerald-600 text-xs mt-1">Mature Cards: <span id="pet-mature">0</span></p>
+                </div>
+
+                <div class="w-full space-y-5">
+                    <div>
+                        <h2 class="text-2xl font-bold text-white mb-1 tracking-widest uppercase">Brainagotchi</h2>
+                        <p class="text-slate-400 text-sm mb-4">Status: <span id="pet-status" class="text-green-400 font-bold">...</span></p>
+                    </div>
+
+                    <div>
+                        <div class="flex justify-between text-xs text-slate-400 mb-1 uppercase">
+                            <span>🍖 Satiety (Daily Pace)</span>
+                            <span id="pet-hunger-text">0%</span>
+                        </div>
+                        <div class="w-full bg-slate-900 rounded-full h-4 border border-slate-700 overflow-hidden">
+                            <div id="pet-hunger-bar" class="bg-orange-500 h-full rounded-full transition-all duration-1000" style="width: 0%"></div>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="flex justify-between text-xs text-slate-400 mb-1 uppercase">
+                            <span>❤️ Health (Retention)</span>
+                            <span id="pet-health-text">0%</span>
+                        </div>
+                        <div class="w-full bg-slate-900 rounded-full h-4 border border-slate-700 overflow-hidden">
+                            <div id="pet-health-bar" class="bg-red-500 h-full rounded-full transition-all duration-1000" style="width: 0%"></div>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="flex justify-between text-xs text-slate-400 mb-1 uppercase">
+                            <span>✨ Happiness (Consistency)</span>
+                            <span id="pet-happy-text">0%</span>
+                        </div>
+                        <div class="w-full bg-slate-900 rounded-full h-4 border border-slate-700 overflow-hidden">
+                            <div id="pet-happy-bar" class="bg-yellow-400 h-full rounded-full transition-all duration-1000" style="width: 0%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <div class="bg-slate-800 p-6 rounded-xl border border-red-900 shadow-xl col-span-1 lg:col-span-2 relative overflow-hidden">
+                <div class="absolute top-0 left-0 w-full h-1 bg-red-600"></div>
+                <h2 class="text-xl font-bold text-red-400 mb-4 uppercase tracking-widest">👺 The Dungeon</h2>
+                <div id="dungeon-content">
+                    <p class="text-slate-400 animate-pulse">Scanning for threats...</p>
+                </div>
+            </div>
+
+            <div class="bg-slate-800 p-6 rounded-xl border border-orange-900 shadow-xl col-span-1 relative overflow-hidden">
+                <div class="absolute top-0 left-0 w-full h-1 bg-orange-500"></div>
+                <h2 class="text-xl font-bold text-orange-400 mb-4 uppercase tracking-widest">⚠️ Oracle Warnings</h2>
+                <ul id="oracle-content" class="space-y-3 text-sm text-slate-300">
+                    <li class="animate-pulse">Consulting the Neural Oracle...</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl">
+            <h2 class="text-2xl font-bold text-white mb-2 uppercase tracking-widest">🏛️ The Armory & Apothecary</h2>
+            <p class="text-slate-400 text-sm mb-6">Spend gold to gear up or heal your Brainagotchi.</p>
+            <div id="shop-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                </div>
+        </div>
+
+    </div>
+
+    <script>
+        // 1. Initialize Supabase
+        // 🔴 REPLACE THESE WITH YOUR ACTUAL SUPABASE URL AND ANON KEY
+        const supabaseUrl = 'https://spfuaeqonskarkbecjkq.supabase.co';
+        const supabaseKey = 'sb_publishable_ekJdch_qWqwVQU4HE1e2Sg_dLo6STXf';
+        const supabaseClient = supabase.createClient(supabaseUrl, supabaseKey);
+
+        let radarChartInstance = null;
+        let globalState = null;
+
+        // We need to fetch user_stats during initApp() to get the daily buffs
+        let userData = null;
+
+        async function initApp() {
+            try {
+                // Fetch Python Engine State
+                const { data: engineData, error: engineError } = await supabaseClient
+                    .from('rpg_state')
+                    .select('state_data')
+                    .eq('id', 'lukas')
+                    .single();
+                if (engineError) throw engineError;
+
+                // Fetch User Potions/Buffs
+                const { data: userDbData, error: userError } = await supabaseClient
+                    .from('user_stats')
+                    .select('*')
+                    .eq('id', 'lukas')
+                    .single();
+                if (userError) throw userError;
+
+                globalState = engineData.state_data;
+                userData = userDbData;
+
+                renderUI();
+            } catch (err) {
+                console.error("Failed to load RPG state", err);
+            }
+        }
+
+        function renderTamagotchi(petBaseData) {
+            if (!petBaseData) return;
+
+            // 1. BULLETPROOF DATA EXTRACTION
+            // This safely falls back to 'metrics' if 'base_metrics' doesn't exist yet,
+            // or defaults to 0 if the backend is completely empty.
+            const base = petBaseData.base_metrics || petBaseData.metrics || {
+                hunger: 0, health: 0, happiness: 0, streak: 0, known_cards: 0
+            };
+
+            const todayStr = new Date().toLocaleDateString('en-CA', {timeZone: 'America/Vancouver'});
+            const buffs = userData.buffs || { date: todayStr, health: 0, hunger: 0 };
+
+            const activeBuffs = (buffs.date === todayStr) ? buffs : { health: 0, hunger: 0 };
+
+            // 2. DYNAMICALLY CALCULATE FINAL STATS (Base Anki + Potions)
+            const finalHunger = Math.min(100, base.hunger + (activeBuffs.hunger || 0));
+            const finalHealth = Math.min(100, base.health + (activeBuffs.health || 0));
+            const finalHappy = Math.min(100, base.happiness);
+
+            // 3. DYNAMICALLY DETERMINE STATUS & SPRITE
+            let status = "Thriving";
+            let sprite = "🥚";
+            let stage = "Egg";
+            let isSick = false;
+
+            const known = base.known_cards;
+            if (known >= 1500) { stage = "Brain Dragon"; sprite = "🐉"; }
+            else if (known >= 500) { stage = "Scholar-Beast"; sprite = "🦉"; }
+            else if (known >= 100) { stage = "Hatchling"; sprite = "🐥"; }
+
+            if (finalHealth < 50 || finalHunger < 20) {
+                status = "Sick";
+                sprite = "🤒";
+                isSick = true;
+            } else if (finalHunger === 0 && finalHappy === 0) {
+                status = "Neglected";
+                sprite = "🪦";
+                isSick = true;
+            }
+
+            // 4. UPDATE THE UI
+            document.getElementById('pet-status').innerText = status;
+            document.getElementById('pet-stage').innerText = stage;
+            document.getElementById('pet-level').innerText = base.streak;
+            document.getElementById('pet-mature').innerText = known;
+
+            const spriteEl = document.getElementById('pet-sprite');
+            spriteEl.innerText = sprite;
+            const statusEl = document.getElementById('pet-status');
+
+            if (isSick) {
+                statusEl.className = "text-red-500 animate-pulse font-bold";
+                spriteEl.classList.remove('animate-bounce');
+                spriteEl.classList.add('opacity-50', 'grayscale');
+            } else {
+                statusEl.className = "text-green-400 font-bold";
+                spriteEl.classList.add('animate-bounce');
+                spriteEl.classList.remove('opacity-50', 'grayscale');
+            }
+
+            document.getElementById('pet-hunger-bar').style.width = `${finalHunger}%`;
+            document.getElementById('pet-hunger-text').innerText = `${finalHunger}%`;
+
+            document.getElementById('pet-health-bar').style.width = `${finalHealth}%`;
+            document.getElementById('pet-health-text').innerText = `${finalHealth}%`;
+
+            document.getElementById('pet-happy-bar').style.width = `${finalHappy}%`;
+            document.getElementById('pet-happy-text').innerText = `${finalHappy}%`;
+        }
+
+        // 3. Main Render Controller
+        function renderUI() {
+            if (!globalState) return;
+
+            // Header UI
+            document.getElementById('char-level').innerText = globalState.character.level || 1;
+            document.getElementById('char-xp').innerText = globalState.character.xp || 0;
+            document.getElementById('char-gold').innerText = globalState.character.gold || 0;
+
+            const syncDate = new Date(globalState.last_updated);
+            document.getElementById('last-sync').innerText = syncDate.toLocaleTimeString();
+
+            // Components
+            renderRadar(globalState.character.radar);
+            renderTamagotchi(globalState.pet);
+            renderDungeon(globalState.dungeon);
+            renderOracle(globalState.predictions);
+            renderShop(globalState.shop);
+        }
+
+        // 4. Radar Chart
+        function renderRadar(stats) {
+            if (!stats) return;
+            const ctx = document.getElementById('radarChart').getContext('2d');
+
+            if (radarChartInstance) radarChartInstance.destroy();
+
+            radarChartInstance = new Chart(ctx, {
+                type: 'radar',
+                data: {
+                    labels: ['Fortitude', 'Precision', 'Celerity', 'Cartography'],
+                    datasets: [{
+                        label: 'Mastery',
+                        data: [stats.fortitude, stats.precision, stats.celerity, stats.cartography],
+                        backgroundColor: 'rgba(139, 92, 246, 0.4)',
+                        borderColor: 'rgba(139, 92, 246, 1)',
+                        pointBackgroundColor: 'rgba(139, 92, 246, 1)',
+                        borderWidth: 2,
+                    }]
+                },
+                options: {
+                    scales: {
+                        r: {
+                            angleLines: { color: 'rgba(255, 255, 255, 0.1)' },
+                            grid: { color: 'rgba(255, 255, 255, 0.1)' },
+                            pointLabels: { color: 'rgba(148, 163, 184, 1)', font: { size: 11, family: 'monospace' } },
+                            ticks: { display: false, min: 0, max: 10 }
+                        }
+                    },
+                    plugins: { legend: { display: false } }
+                }
+            });
+        }
+
+        // 6. Dungeon Boss UI
+        function renderDungeon(dungeon) {
+            const container = document.getElementById('dungeon-content');
+            if (!dungeon || !dungeon.active) {
+                container.innerHTML = `<p class="text-green-400 font-mono">✨ The dungeon is clear. No fragile memories detected.</p>`;
+                return;
+            }
+
+            container.innerHTML = `
+                <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-red-900/20 p-4 rounded border border-red-900/50">
+                    <div>
+                        <p class="text-sm text-red-400 uppercase tracking-widest font-bold">Boss Spawned</p>
+                        <h3 class="text-2xl font-black text-white mt-1">${dungeon.name}</h3>
+                        <p class="text-slate-300 mt-3 font-mono text-xs bg-black/40 p-2 rounded border border-red-900/50">Query: ${dungeon.strategy}</p>
+                    </div>
+                    <div class="text-left md:text-right mt-4 md:mt-0">
+                        <p class="text-slate-400 mb-1 uppercase text-xs tracking-widest">Friction HP</p>
+                        <p class="text-4xl font-bold text-red-500">🩸 ${dungeon.hp}</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        // 7. ML Oracle UI
+        function renderOracle(predictions) {
+            const container = document.getElementById('oracle-content');
+            container.innerHTML = '';
+
+            if (!predictions || !predictions.cursed_due || predictions.cursed_due.length === 0) {
+                container.innerHTML = `<li class="text-green-400 font-mono">All upcoming concepts are semantically stable.</li>`;
+                return;
+            }
+
+            // Show top 4 cursed cards
+            predictions.cursed_due.slice(0, 4).forEach(threat => {
+                container.innerHTML += `
+                    <li class="bg-slate-900/50 p-3 rounded border border-slate-700 flex justify-between items-center gap-4">
+                        <span class="truncate text-slate-300" title="${threat['clean_text']}">${threat['clean_text']}</span>
+                        <span class="text-orange-400 font-mono text-xs bg-orange-900/30 px-2 py-1 rounded border border-orange-900/50 shrink-0">
+                            ${threat['Cursed_Probability'].toFixed(0)}% Risk
+                        </span>
+                    </li>
+                `;
+            });
+        }
+
+        // 8. Shop UI
+        function renderShop(shopItems) {
+            const container = document.getElementById('shop-container');
+            container.innerHTML = '';
+
+            if (!shopItems) return;
+
+            // Append Apothecary items to the daily shop dynamically
+            const fullShop = [
+                ...shopItems,
+                { id: "med_1", name: "🧪 Memory Elixir", type: "Medicine", cost: 30, desc: "Heals pet health." },
+                { id: "treat_1", name: "🥩 Premium Treat", type: "Food", cost: 15, desc: "Fills pet satiety." }
+            ];
+
+            fullShop.forEach(item => {
+                const descHtml = item.desc ? `<p class="text-xs text-slate-400 mt-2">${item.desc}</p>` : '';
+                container.innerHTML += `
+                    <div class="bg-slate-700/30 p-4 rounded-lg border border-slate-600 flex flex-col justify-between hover:border-yellow-500/50 transition-colors">
+                        <div>
+                            <p class="font-bold text-lg text-white">${item.name}</p>
+                            <p class="text-xs text-yellow-500 uppercase mt-1 tracking-widest">${item.type}</p>
+                            ${descHtml}
+                        </div>
+                        <button onclick="buyItem('${item.id}', ${item.cost})" class="mt-4 w-full bg-slate-800 hover:bg-yellow-600 border border-slate-600 hover:border-yellow-500 text-white px-4 py-2 rounded transition font-bold group">
+                            <span class="group-hover:hidden">💰 ${item.cost}</span>
+                            <span class="hidden group-hover:inline">Purchase</span>
+                        </button>
+                    </div>
+                `;
+            });
+        }
+
+        // 9. Purchasing Logic
+        async function buyItem(itemId, cost) {
+            if (globalState.character.gold < cost) {
+                alert("Not enough gold!");
+                return;
+            }
+
+            // 1. Optimistic UI update (Instant feedback)
+            globalState.character.gold -= cost;
+
+            // Instantly apply the healing to the UI
+            if (itemId === 'med_1') {
+                globalState.pet.metrics.health = Math.min(100, globalState.pet.metrics.health + 30);
+            } else if (itemId === 'treat_1') {
+                globalState.pet.metrics.hunger = Math.min(100, globalState.pet.metrics.hunger + 30);
+            }
+            renderUI();
+
+            try {
+                // 2. Fetch current user_stats
+                const { data: userData, error: fetchError } = await supabaseClient
+                    .from('user_stats')
+                    .select('*')
+                    .eq('id', 'lukas')
+                    .single();
+
+                if (fetchError) throw fetchError;
+
+                let newSpentGold = (userData.spent_gold || 0) + cost;
+                let currentInv = userData.inventory?.display_case || [];
+
+                // 3. Handle Daily Buffs (Syncing to Vancouver time)
+                const todayStr = new Date().toLocaleDateString('en-CA', {timeZone: 'America/Vancouver'});
+                let currentBuffs = userData.buffs || { date: todayStr, health: 0, hunger: 0 };
+
+                // Reset buffs if it's a new day
+                if (currentBuffs.date !== todayStr) {
+                    currentBuffs = { date: todayStr, health: 0, hunger: 0 };
+                }
+
+                if (itemId === 'med_1') currentBuffs.health += 30;
+                if (itemId === 'treat_1') currentBuffs.hunger += 30;
+
+                // 4. Track non-consumables in display case
+                if (!itemId.startsWith("med_") && !itemId.startsWith("treat_")) {
+                    if (!currentInv.includes(itemId)) {
+                        currentInv.push(itemId);
+                    }
+                }
+
+                // 5. Write everything back to database
+                const { error: updateError } = await supabaseClient
+                    .from('user_stats')
+                    .update({
+                        spent_gold: newSpentGold,
+                        inventory: { display_case: currentInv },
+                        buffs: currentBuffs
+                    })
+                    .eq('id', 'lukas');
+
+                if (updateError) throw updateError;
+
+                console.log(`Purchase of ${itemId} saved. Pet healed!`);
+            } catch (err) {
+                console.error("Purchase failed", err);
+                alert("Transaction failed. Reverting.");
+                // Note: a robust app would revert the optimistic UI update here
+            }
+        }
+
+        // Boot up the engine
+        initApp();
+
+    </script>
+</body>
+</html>

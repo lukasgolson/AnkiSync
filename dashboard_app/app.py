@@ -170,42 +170,6 @@ def update_user_stats(updates):
     supabase.table('user_stats').update(updates).eq('id', 'lukas').execute()
 
 
-def calculate_rpg_state(cards_df, revlog_df, db_stats):
-    """Calculates the current state of the player based on deck performance and database ledger."""
-    mature_count = len(cards_df[cards_df['knowledge_state'] == 'Known'])
-    avg_s = cards_df['s'].mean() if 's' in cards_df.columns else 0
-
-    total_xp = int((mature_count * 20) + (avg_s * 10))
-    gross_gold = int(total_xp * 0.1)
-
-    interest = int(gross_gold * 0.05) if avg_s > 21 else 0
-
-    # --- FIXED TAX LOGIC: Only penalize actual demotions (Lapses) ---
-    if 'type' in revlog_df.columns:
-        # type == 1 means the card was in the "Review" phase.
-        # ease == 1 means you hit "Again".
-        today_demotions = len(revlog_df[
-                                  (revlog_df['review_date'] == get_local_today()) &
-                                  (revlog_df['ease'] == 1) &
-                                  (revlog_df['type'] == 1)
-                                  ])
-    else:
-        # Fallback just in case
-        today_demotions = 0
-
-    # Tax is 10 gold per actual memory lapse
-    daily_tax = today_demotions * 10
-
-    bonus_gold = db_stats.get('bonus_gold', 0)
-    spent_gold = db_stats.get('spent_gold', 0)
-
-    # Calculate exact net worth before applying the zero-floor
-    raw_gold = (gross_gold + interest + bonus_gold) - (spent_gold + daily_tax)
-    current_gold = max(0, raw_gold)
-    tax_debt = abs(raw_gold) if raw_gold < 0 else 0
-
-    return total_xp, current_gold, gross_gold, interest, daily_tax, avg_s, bonus_gold, tax_debt
-
 
 with st.spinner("Loading & crunching Anki data..."):
     decks_df, notes_df, cards_df, revlog_df = load_data()
@@ -303,9 +267,8 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, mapping, tab7, tab9 = st.tabs([
-    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness", "Game"
-])
+tab1, tab2, tab3, tab4, mapping, tab7 = st.tabs([
+    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness"])
 
 # --- TAB 1: OVERVIEW ---
 with tab1:
@@ -554,15 +517,14 @@ with tab2:
     with subtab2:
         with st.expander("The Neural Oracle", expanded=True):
             st.markdown("""
-            ### The Neural Oracle
-            This module uses **Dense Semantic Embeddings** and **Gradient Boosting** to predict cognitive friction.
-            * **The Regressor:** Predicts the fundamental Difficulty ($D$) of Unseen cards.
-            * **The Classifier:** Analyzes cards due soon and predicts my probability of lapsing (failing) based on my historical semantic weaknesses.
+            ### The Neural Oracle (V2)
+            This module uses **Dense Semantic Embeddings** and **Structural Analytics** to predict cognitive friction.
+            * **The Friction Regressor:** Predicts the fundamental Difficulty (1-10) of Unseen cards.
+            * **The Time Oracle:** Predicts the cognitive load (Seconds per Review) of Unseen cards.
+            * **The Cursed Concept Classifier:** Analyzes cards due soon to flag historically toxic semantic patterns, regardless of what the spaced repetition algorithm says.
             """)
 
 
-            # 1. Prepare the Core Data
-            # We need the embedder you already loaded in Tab 6
             @st.cache_resource
             def load_embedder():
                 from sentence_transformers import SentenceTransformer
@@ -577,96 +539,138 @@ with tab2:
                 return re.sub(r'[^\w\s]', ' ', str(raw).lower())
 
 
-            # Safely prepare the dataframe
+            # --- NEW: Structural Feature Engineering ---
+            def get_structural_features(text):
+                text_str = str(text)
+                word_count = len(text_str.split())
+                char_count = len(text_str)
+                # Check for Anki cloze deletions (e.g., {{c1::answer}})
+                has_cloze = 1 if 'c1::' in text_str or 'c2::' in text_str else 0
+                return word_count, char_count, has_cloze
+
+
             ml_df = filtered_cards.copy()
             ml_df['nlp_ready'] = ml_df.apply(lambda x: clean_for_embeddings(x['clean_text'], x['tags']), axis=1)
 
+            # Apply structural features
+            ml_df[['word_count', 'char_count', 'has_cloze']] = ml_df['card_front'].apply(
+                lambda x: pd.Series(get_structural_features(x))
+            )
+
+            # --- NEW: Calculate True Target for Learning Time ---
+            if not filtered_revlog.empty:
+                time_stats = filtered_revlog.groupby('cid')['time'].mean().reset_index()
+                # Convert milliseconds to seconds
+                time_stats['avg_time_sec'] = time_stats['time'] / 1000.0
+                ml_df = ml_df.merge(time_stats[['cid', 'avg_time_sec']], left_on='id', right_on='cid', how='left')
+
             if len(ml_df[ml_df['knowledge_state'] != 'Unseen']) > 50:
-                with st.spinner("Generating dense 384-D semantic embeddings and training Gradient Boosting trees..."):
+                with st.spinner("Generating 384-D semantic embeddings and training Gradient Boosting trees..."):
                     from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
                     import numpy as np
 
-                    # --- MODEL 1: THE FRICTION REGRESSOR (For Unseen Cards) ---
-                    st.subheader("🌋 The Horizon: Unseen Difficulty Predictions")
+                    # ==========================================
+                    # MODEL 1 & 2: THE HORIZON (Difficulty & Time)
+                    # ==========================================
+                    st.subheader("🌋 The Horizon: Unseen Card Predictions")
 
-                    # Split data
-                    train_reg = ml_df[(ml_df['knowledge_state'] != 'Unseen') & (ml_df['d'].notna())].copy()
+                    # Training Data for Regressors
+                    train_reg = ml_df[(ml_df['knowledge_state'] != 'Unseen') & (ml_df['d'].notna()) & (
+                        ml_df['avg_time_sec'].notna())].copy()
                     target_reg = ml_df[ml_df['knowledge_state'] == 'Unseen'].copy()
 
-                    if not target_reg.empty:
-                        # Generate Embeddings (X)
+                    if not target_reg.empty and not train_reg.empty:
+                        # 1. Feature Stacking (Embeddings + Structure)
                         X_train_emb = embedder.encode(train_reg['nlp_ready'].tolist(), show_progress_bar=False)
+                        X_train_struct = train_reg[['word_count', 'char_count', 'has_cloze']].values
+                        X_train_combined = np.hstack((X_train_emb, X_train_struct))
+
                         X_target_emb = embedder.encode(target_reg['nlp_ready'].tolist(), show_progress_bar=False)
+                        X_target_struct = target_reg[['word_count', 'char_count', 'has_cloze']].values
+                        X_target_combined = np.hstack((X_target_emb, X_target_struct))
 
-                        y_train_reg = train_reg['d']
+                        # 2. Train Difficulty Regressor
+                        y_train_diff = train_reg['d']
+                        gbr_diff = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.1, random_state=42)
+                        gbr_diff.fit(X_train_combined, y_train_diff)
+                        target_reg['Predicted_Difficulty'] = gbr_diff.predict(X_target_combined)
 
-                        # Train Gradient Boosting Regressor
-                        gbr = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.1, random_state=42)
-                        gbr.fit(X_train_emb, y_train_reg)
+                        # 3. Train Time/Effort Regressor
+                        # Filter out crazy outliers (e.g., leaving Anki open for 30 mins)
+                        train_time_clean = train_reg[train_reg['avg_time_sec'] < 120]
+                        X_train_time_emb = embedder.encode(train_time_clean['nlp_ready'].tolist(),
+                                                           show_progress_bar=False)
+                        X_train_time_struct = train_time_clean[['word_count', 'char_count', 'has_cloze']].values
+                        X_train_time_combined = np.hstack((X_train_time_emb, X_train_time_struct))
 
-                        # Predict
-                        target_reg['Predicted_Difficulty'] = gbr.predict(X_target_emb)
+                        y_train_time = train_time_clean['avg_time_sec']
+                        gbr_time = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.1, random_state=42)
+                        gbr_time.fit(X_train_time_combined, y_train_time)
+                        target_reg['Predicted_Time_Sec'] = gbr_time.predict(X_target_combined)
 
-                        # Display Top Threats
-                        threats = target_reg[['clean_text', 'deck_name', 'Predicted_Difficulty', 'tags']].sort_values(
+                        # 4. Display Horizon Output
+                        threats = target_reg[['clean_text', 'deck_name', 'Predicted_Difficulty', 'Predicted_Time_Sec',
+                                              'word_count']].sort_values(
                             by='Predicted_Difficulty', ascending=False
-                        ).rename(columns={'clean_text':           'Card Text', 'deck_name': 'Deck',
-                                          'Predicted_Difficulty': 'Predicted Friction'})
+                        ).rename(columns={
+                            'clean_text':           'Card Text',
+                            'deck_name':            'Deck',
+                            'Predicted_Difficulty': 'Predicted Friction (1-10)',
+                            'Predicted_Time_Sec':   'Est. Time/Rep (Sec)',
+                            'word_count':           'Words'
+                        })
 
                         st.markdown(
-                            "These **Unseen** cards have semantic profiles matching my most difficult historical concepts.")
+                            "These **Unseen** cards have semantic and structural profiles matching your hardest historical concepts.")
                         st.dataframe(
-                            threats.head(50).style.background_gradient(subset=['Predicted Friction'], cmap='Reds',
-                                                                       vmin=1,
-                                                                       vmax=10).format(
-                                {'Predicted Friction': "{:.1f}"}),
+                            threats.head(50).style.background_gradient(subset=['Predicted Friction (1-10)'],
+                                                                       cmap='Reds', vmin=1, vmax=10)
+                            .background_gradient(subset=['Est. Time/Rep (Sec)'], cmap='Purples', vmin=5, vmax=30)
+                            .format({'Predicted Friction (1-10)': "{:.1f}", 'Est. Time/Rep (Sec)': "{:.1f}s"}),
                             use_container_width=True, hide_index=True
                         )
                     else:
                         st.success("No Unseen cards left! The Horizon is clear.")
 
-                    # --- MODEL 2: THE LAPSE CLASSIFIER (For Due Cards) ---
+                    # ==========================================
+                    # MODEL 3: THE CURSED CONCEPT CLASSIFIER
+                    # ==========================================
                     st.divider()
-                    st.subheader("⚠️ Imminent Lapses: High-Risk Due Cards")
+                    st.subheader("⚠️ Cursed Concepts: High-Risk Semantic Patterns")
 
-                    # We define a "Struggling" card as one with a historical lapse rate > 15% AND low stability
-                    train_clf = ml_df[ml_df['reps'] > 2].copy()
+                    # Target: Strictly historical failure rate (No FSRS target leakage)
+                    train_clf = ml_df[ml_df['reps'] > 3].copy()
                     train_clf['failure_rate'] = train_clf['lapses'] / train_clf['reps']
+                    train_clf['is_cursed'] = (train_clf['failure_rate'] > 0.15).astype(int)
 
-                    # Target: 1 if it's a high-risk card, 0 otherwise
-                    train_clf['is_high_risk'] = ((train_clf['failure_rate'] > 0.15) & (train_clf['s'] < 14)).astype(int)
-
-                    # We only want to predict on cards that are actually Due in the next 3 days
                     future_3_days = get_local_today() + timedelta(days=3)
                     due_target = ml_df[(ml_df['due_date'].notna()) & (ml_df['due_date'] <= future_3_days) & (
-                            ml_df['knowledge_state'] != 'Unseen')].copy()
+                                ml_df['knowledge_state'] != 'Unseen')].copy()
 
-                    if not due_target.empty and train_clf['is_high_risk'].sum() > 10:
-                        # Feature Engineering for Classifier: Embeddings + FSRS State
-                        # We stack the dense embeddings with the current FSRS metrics
+                    if not due_target.empty and train_clf['is_cursed'].sum() > 10:
+
+                        # Features: ONLY Embeddings + Structure. Absolutely zero FSRS state data.
                         X_clf_emb = embedder.encode(train_clf['nlp_ready'].tolist(), show_progress_bar=False)
-                        X_clf_fsrs = train_clf[['d', 's', 'ivl']].fillna(0).values
-                        X_train_clf = np.hstack((X_clf_emb, X_clf_fsrs))
+                        X_clf_struct = train_clf[['word_count', 'char_count', 'has_cloze']].values
+                        X_train_clf = np.hstack((X_clf_emb, X_clf_struct))
 
-                        y_train_clf = train_clf['is_high_risk']
+                        y_train_clf = train_clf['is_cursed']
 
-                        # Train Gradient Boosting Classifier
+                        # Train Classifier
                         gbc = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.05, class_weight='balanced',
                                                              random_state=42)
                         gbc.fit(X_train_clf, y_train_clf)
 
-                        # Prepare Target Data
+                        # Predict on Due Cards
                         X_due_emb = embedder.encode(due_target['nlp_ready'].tolist(), show_progress_bar=False)
-                        X_due_fsrs = due_target[['d', 's', 'ivl']].fillna(0).values
-                        X_target_clf = np.hstack((X_due_emb, X_due_fsrs))
+                        X_due_struct = due_target[['word_count', 'char_count', 'has_cloze']].values
+                        X_target_clf = np.hstack((X_due_emb, X_due_struct))
 
-                        # Predict Probability of being a High-Risk Lapse
                         probs = gbc.predict_proba(X_target_clf)[:, 1] * 100
-                        due_target['Lapse_Probability'] = probs
+                        due_target['Cursed_Probability'] = probs
 
 
-                        # Calculate current FSRS Retrievability (R)
-                        # Formula: R = 0.9 ^ (t / S)
+                        # Calculate current FSRS Retrievability (R) as a baseline comparison
                         def calc_retrievability(row):
                             if pd.isna(row['last_review_datetime']) or pd.isna(row['s']) or row['s'] <= 0:
                                 return 100.0
@@ -677,39 +681,36 @@ with tab2:
 
                         due_target['Current_Recall_Prob'] = due_target.apply(calc_retrievability, axis=1)
 
-                        # Filter and sort by the highest machine-learning predicted lapse risk
-                        lapses = due_target[due_target['Lapse_Probability'] > 50].sort_values('Lapse_Probability',
-                                                                                              ascending=False)
+                        lapses = due_target[due_target['Cursed_Probability'] > 50].sort_values('Cursed_Probability',
+                                                                                               ascending=False)
 
                         if not lapses.empty:
                             st.markdown(
-                                f"The Neural Oracle has flagged **{len(lapses)} cards** due soon that have a highly toxic mix of semantic complexity and low stability.")
+                                f"The Oracle has flagged **{len(lapses)} upcoming cards** as 'Cursed'. Regardless of what the spacing algorithm says, the actual text of these cards triggers a high historical failure rate for you.")
 
                             lapse_display = lapses[
-                                ['clean_text', 'due_date', 'Lapse_Probability', 'Current_Recall_Prob', 'd']].rename(
+                                ['clean_text', 'due_date', 'Cursed_Probability', 'Current_Recall_Prob']].rename(
                                 columns={
-                                    'clean_text':        'Card Text', 'due_date': 'Due Date',
-                                    'Lapse_Probability': 'AI Lapse Risk (%)', 'Current_Recall_Prob': 'FSRS Recall (%)',
-                                    'd':                 'Friction'
+                                    'clean_text':          'Card Text',
+                                    'due_date':            'Due Date',
+                                    'Cursed_Probability':  'Semantic Threat Level (%)',
+                                    'Current_Recall_Prob': 'FSRS Current Recall (%)'
                                 })
 
                             st.dataframe(
-                                lapse_display.head(50).style.background_gradient(subset=['AI Lapse Risk (%)'],
+                                lapse_display.head(50).style.background_gradient(subset=['Semantic Threat Level (%)'],
                                                                                  cmap='Oranges', vmin=50, vmax=100)
-                                .background_gradient(subset=['FSRS Recall (%)'], cmap='RdYlGn', vmin=70, vmax=100)
-                                .format(
-                                    {'AI Lapse Risk (%)': "{:.1f}%", 'FSRS Recall (%)': "{:.1f}%",
-                                     'Friction':          "{:.1f}"}),
+                                .background_gradient(subset=['FSRS Current Recall (%)'], cmap='RdYlGn', vmin=70,
+                                                     vmax=100)
+                                .format({'Semantic Threat Level (%)': "{:.1f}%", 'FSRS Current Recall (%)': "{:.1f}%"}),
                                 use_container_width=True, hide_index=True
                             )
                         else:
-                            st.success("My due cards look remarkably stable. The Oracle predicts no major lapses!")
+                            st.success("Your upcoming cards are semantically safe. No cursed concepts detected!")
                     else:
-                        st.info("Not enough historical lapse data or upcoming due cards to run the classifier.")
-
+                        st.info("Not enough historical lapse data to define 'Cursed' patterns yet.")
             else:
-                st.warning(
-                    "I need to review at least 50 cards before the Neural Oracle has enough data to model Lukas' brain.")
+                st.warning("I need more active cards in the rotation before the Oracle can calibrate to your brain.")
 
 # --- TAB 3: STUDY OPTIMIZATION ---
 with tab3:
@@ -1382,322 +1383,6 @@ with tab7:
 
 
 
-# --- TAB 9: THE ADVENTURER'S GUILD & ARMORY ---
-import random
 
-with tab9:
-    # 1. OPTIMISTIC UI STATE BUFFER
-    # Only pull from Supabase if we haven't loaded the stats into this session yet
-    if 'db_stats' not in st.session_state:
-        fetched_stats = get_user_stats()
-        # Fallback dictionary if the database row is completely empty
-        if not fetched_stats:
-            fetched_stats = {"spent_gold": 0, "bonus_gold": 0, "inventory": {}, "claimed_bounties": {}}
-        st.session_state['db_stats'] = fetched_stats
-
-    db_stats = st.session_state['db_stats']
-
-    # Safely initialize keys to prevent KeyError crashes
-    if 'bonus_gold' not in db_stats:
-        db_stats['bonus_gold'] = 0
-    if 'spent_gold' not in db_stats:
-        db_stats['spent_gold'] = 0
-    if 'claimed_bounties' not in db_stats:
-        db_stats['claimed_bounties'] = {}
-    if 'inventory' not in db_stats:
-        db_stats['inventory'] = {'display_case': []}
-
-    inventory = db_stats['inventory']
-    display_case = inventory.get('display_case', [])
-
-    # Run Calculation Engine with the new tax_debt variable
-    total_xp, current_gold, gross_gold, interest, daily_tax, avg_s, bonus_gold, tax_debt = calculate_rpg_state(
-        filtered_cards, filtered_revlog, db_stats
-    )
-
-    user_level = int((total_xp / 150) ** 0.5) + 1
-    fortitude_lvl = int(avg_s / 5)
-    retention = (filtered_revlog['ease'] > 1).mean() * 100 if not filtered_revlog.empty else 0
-    precision_lvl = int(retention / 10)
-    avg_time = filtered_revlog['time'].mean() / 1000 if not filtered_revlog.empty else 0
-    celerity_lvl = int(max(0, 100 - (avg_time * 5)) / 10)
-    seen_cards = len(filtered_cards[filtered_cards['knowledge_state'] != 'Unseen'])
-    total_cards = len(filtered_cards)
-    cart_lvl = int((seen_cards / total_cards) * 10) if total_cards > 0 else 0
-
-    subtab_guild, subtab_armory = st.tabs(["⚔️ Guild Hall (Quests)", "🏛️ The Armory (Shop)"])
-
-    # ==========================================
-    # SUB-TAB 1: GUILD HALL
-    # ==========================================
-    with subtab_guild:
-        with st.container(border=True):
-            st.header(f"🛡️ Scholar Level {user_level}")
-
-            xp_for_current = (user_level - 1) ** 2 * 150
-            xp_for_next = user_level ** 2 * 150
-            denom = (xp_for_next - xp_for_current)
-            lvl_progress = (total_xp - xp_for_current) / denom if denom > 0 else 0
-            st.progress(min(max(lvl_progress, 0.0), 1.0),
-                        text=f"✨ {total_xp - xp_for_current} / {denom} XP to Level {user_level + 1}")
-
-            col_radar, col_treasury = st.columns([2, 1])
-
-            with col_radar:
-                radar_data = pd.DataFrame(dict(
-                    r=[fortitude_lvl, precision_lvl, celerity_lvl, cart_lvl, fortitude_lvl],
-                    theta=['Fortitude', 'Precision', 'Celerity', 'Cartography', 'Fortitude']
-                ))
-                fig_radar = px.line_polar(radar_data, r='r', theta='theta', line_close=True)
-                fig_radar.update_traces(fill='toself', line_color='#8b5cf6')
-                fig_radar.update_layout(height=280, margin=dict(t=20, b=20, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig_radar, use_container_width=True)
-
-                with col_treasury:
-                    st.markdown("### 🏛️ Treasury")
-                    st.metric("Current Gold Balance", f"💰 {current_gold}")
-                    st.caption(f"**Gross XP Gold:** 🪙 {gross_gold}")
-                    st.caption(f"**Quest Bonus Gold:** 💰 {bonus_gold}")
-                    st.caption(f"**Daily Interest:** 📈 +{interest}")
-                    if tax_debt > 0:
-                        st.error(f"⚠️ **Tax Debt:** -{tax_debt} Gold (Clear by earning XP!)")
-
-            # --- THE BOUNTY BOARD (INSTANT PAYOUTS) ---
-            with st.container(border=True):
-                st.subheader("📜 Daily Bounty Board")
-
-                today_str = str(get_local_today())
-                bounties = db_stats['claimed_bounties']
-
-                if bounties.get('date') != today_str:
-                    bounties = {"date": today_str, "q1": False, "q2": False, "q3": False}
-                    db_stats['claimed_bounties'] = bounties
-
-                cards_due_today = len(filtered_cards[filtered_cards['s'] < 1])
-                unseen_remaining = total_cards - seen_cards
-
-                scribe_goal = max(20, min(100, cards_due_today))
-                explorer_goal = max(5, min(25, int(unseen_remaining * 0.05)))
-
-                today_revs = filtered_revlog[filtered_revlog['review_date'] == get_local_today()]
-                today_count = len(today_revs)
-                today_new = len(filtered_cards[filtered_cards['creation_date'] == get_local_today()])
-
-
-                # OPTIMISTIC UPDATE FUNCTION
-                def claim_bounty(q_key, reward):
-                    # 1. Update Session State (Instant UI)
-                    db_stats['claimed_bounties'][q_key] = True
-                    db_stats['bonus_gold'] += reward
-                    st.session_state['db_stats'] = db_stats
-
-                    # 2. Sync to Database
-                    update_user_stats({
-                        "claimed_bounties": db_stats['claimed_bounties'],
-                        "bonus_gold":       db_stats['bonus_gold']
-                    })
-
-                    st.toast(f"Claimed {reward} Gold!", icon="💰")
-                    st.rerun()
-
-
-            q1, q2, q3 = st.columns(3)
-            with q1:
-                st.info(f"**The Scribe**\n\nComplete {scribe_goal} Reviews")
-                st.progress(min(1.0, today_count / scribe_goal) if scribe_goal > 0 else 1.0)
-                if bounties.get('q1'):
-                    st.success("✅ Claimed")
-                elif today_count >= scribe_goal:
-                    if st.button("Claim 💰 20", key="btn_q1"):
-                        claim_bounty("q1", 20)
-                else:
-                    st.write(f"{today_count} / {scribe_goal}")
-
-            with q2:
-                st.info(f"**The Explorer**\n\nSee {explorer_goal} New Cards")
-                st.progress(min(1.0, today_new / explorer_goal) if explorer_goal > 0 else 1.0)
-                if bounties.get('q2'):
-                    st.success("✅ Claimed")
-                elif today_new >= explorer_goal:
-                    if st.button("Claim 💰 30", key="btn_q2"):
-                        claim_bounty("q2", 30)
-                else:
-                    st.write(f"{today_new} / {explorer_goal}")
-
-            with q3:
-                st.info(f"**The Perfectionist**\n\nMaintain 90% Accuracy")
-                today_acc = (today_revs['ease'] > 1).mean() * 100 if today_count > 0 else 0
-                st.progress(min(1.0, today_acc / 90))
-                if bounties.get('q3'):
-                    st.success("✅ Claimed")
-                elif today_acc >= 90 and today_count >= 10:
-                    if st.button("Claim 💰 50", key="btn_q3"):
-                        claim_bounty("q3", 50)
-                else:
-                    st.write(f"{today_acc:.1f}% / 90.0%")
-
-        # --- THE DUNGEON ---
-        with st.container(border=True):
-            st.subheader("👺 The Dungeon: Active Threats")
-            fragile_cards = filtered_cards[filtered_cards['s'] < 3]
-
-            if not fragile_cards.empty and 'deck_name' in fragile_cards.columns:
-                boss_stats = fragile_cards.groupby('deck_name').agg(
-                    avg_stability=('s', 'mean'),
-                    count=('id', 'count'),
-                    total_difficulty=('d', 'sum')
-                )
-                bosses = boss_stats[boss_stats['count'] > 10].sort_values('avg_stability')
-
-                if not bosses.empty:
-                    target_deck = bosses.index[0]
-                    boss_data = bosses.loc[target_deck]
-                    boss_hp = int(boss_data['total_difficulty'] * 10)
-                    display_name = str(target_deck).split(' ➔ ')[-1].upper()
-
-                    col_b1, col_b2 = st.columns([1, 2])
-                    with col_b1:
-                        st.error(f"⚠️ **BOSS SPAWNED**\n\n**{display_name} Guardian**")
-                        st.metric("Boss HP (Friction)", f"🩸 {boss_hp}")
-                    with col_b2:
-                        if st.button("⚔️ Generate Slay-List", key="btn_boss", use_container_width=True):
-                            boss_cards = filtered_cards[
-                                (filtered_cards['deck_name'] == target_deck) & (filtered_cards['s'] < 3)]
-                            st.dataframe(boss_cards[['clean_text', 'd', 's']].sort_values('d', ascending=False),
-                                         height=200)
-                            st.info(
-                                f"💡 **Strategy:** Search `\"deck:{target_deck}\" prop:s<3` in Anki and review them!")
-                else:
-                    st.success("✨ The dungeon is clear.")
-            else:
-                st.success("✨ The dungeon is clear.")
-
-    # ==========================================
-    # SUB-TAB 2: THE ARMORY (DAILY SHOP)
-    # ==========================================
-    with subtab_armory:
-        today_seed = get_local_today().toordinal()
-        random.seed(today_seed)
-
-
-        def get_top_concept_words(df_subset, n=15):
-            if df_subset.empty:
-                return []
-            text = " ".join(df_subset['clean_text'].dropna().astype(str).tolist()).lower()
-            text = re.sub(r'[^a-z\s]', '', text)
-            words = text.split()
-            stops = GLOBAL_STOP_WORDS
-            clean_words = [w for w in words if len(w) > 4 and w not in stops]
-            if not clean_words:
-                return []
-            return pd.Series(clean_words).value_counts().head(n).index.tolist()
-
-
-        weapon_pool = get_top_concept_words(filtered_cards[filtered_cards['d'] < 4])
-        armor_pool = get_top_concept_words(filtered_cards[filtered_cards['s'] > 21])
-        relic_pool = get_top_concept_words(
-            filtered_cards[filtered_cards['knowledge_state'].isin(['Unseen', 'Learning'])])
-
-        w_concept = random.choice(weapon_pool).capitalize() if weapon_pool else "Iron"
-        a_concept = random.choice(armor_pool).capitalize() if armor_pool else "Leather"
-        r_concept = random.choice(relic_pool).capitalize() if relic_pool else "Novice"
-
-        if celerity_lvl > precision_lvl:
-            weapon_item = f"🗡️ The {w_concept} Scalpel"
-        elif precision_lvl > 7:
-            weapon_item = f"🏹 {w_concept} Longbow"
-        else:
-            weapon_item = f"📖 {w_concept} Grimoire"
-
-        if fortitude_lvl >= 10:
-            armor_item = f"🛡️ {a_concept} Carapace"
-        elif fortitude_lvl >= 5:
-            armor_item = f"🧥 {a_concept} Mantle"
-        else:
-            armor_item = f"👕 {a_concept} Tunic"
-
-        if cart_lvl >= 9:
-            relic_item = f"🧭 The {r_concept} Astrolabe"
-        else:
-            relic_item = f"🕯️ {r_concept} Lantern"
-
-        with st.container(border=True):
-            st.subheader(f"🛒 The Daily Merchant ({get_local_today().strftime('%b %d')})")
-            st.markdown(f"**Available Gold:** 💰 {current_gold}")
-
-            col_s1, col_s2, col_s3 = st.columns(3)
-
-
-            def buy_item(item_name, cost):
-                # 1. Update Session State (Instant UI)
-                db_stats['spent_gold'] += cost
-                display_case.append(item_name)
-                db_stats['inventory']['display_case'] = display_case
-                st.session_state['db_stats'] = db_stats
-
-                # 2. Sync to Database
-                update_user_stats({
-                    "spent_gold": db_stats['spent_gold'],
-                    "inventory":  db_stats['inventory']
-                })
-
-                st.toast(f"Purchased {item_name}!", icon="🎉")
-                st.rerun()
-
-
-            with col_s1:
-                st.info(f"**Main Hand**\n\n{weapon_item}")
-                if weapon_item in display_case:
-                    st.button("Sold Out", disabled=True, key="so_w", use_container_width=True)
-                elif current_gold >= 50:
-                    if st.button("Buy for 💰 50", key="buy_w", use_container_width=True):
-                        buy_item(weapon_item, 50)
-                else:
-                    st.button("Needs 💰 50", disabled=True, key="poor_w", use_container_width=True)
-
-            with col_s2:
-                st.info(f"**Body Armor**\n\n{armor_item}")
-                if armor_item in display_case:
-                    st.button("Sold Out", disabled=True, key="so_a", use_container_width=True)
-                elif current_gold >= 100:
-                    if st.button("Buy for 💰 100", key="buy_a", use_container_width=True):
-                        buy_item(armor_item, 100)
-                else:
-                    st.button("Needs 💰 100", disabled=True, key="poor_a", use_container_width=True)
-
-            with col_s3:
-                st.info(f"**Accessory**\n\n{relic_item}")
-                if relic_item in display_case:
-                    st.button("Sold Out", disabled=True, key="so_r", use_container_width=True)
-                elif current_gold >= 75:
-                    if st.button("Buy for 💰 75", key="buy_r", use_container_width=True):
-                        buy_item(relic_item, 75)
-                else:
-                    st.button("Needs 💰 75", disabled=True, key="poor_r", use_container_width=True)
-
-        with st.container(border=True):
-            st.subheader("🏛️ The Grand Hall of Relics")
-            st.markdown("Your historical collection of academic artifacts.")
-
-            if display_case:
-                weapons = [item for item in display_case if any(icon in item for icon in ['🗡️', '🏹', '📖'])]
-                armors = [item for item in display_case if any(icon in item for icon in ['🛡️', '🧥', '👕'])]
-                relics = [item for item in display_case if any(icon in item for icon in ['🧭', '🕯️'])]
-
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.markdown("**🗡️ Weapons**")
-                    for w in reversed(weapons):
-                        st.caption(w)
-                with c2:
-                    st.markdown("**🛡️ Armor**")
-                    for a in reversed(armors):
-                        st.caption(a)
-                with c3:
-                    st.markdown("**🧭 Relics**")
-                    for r in reversed(relics):
-                        st.caption(r)
-            else:
-                st.info("The hall is empty. Check the Bounty Board to earn your first gold!")
 
 
