@@ -885,6 +885,7 @@ with mapping:
         # 1. Map & Web Settings
         st.sidebar.divider()
         st.sidebar.header("🌌 Map & Web Settings")
+        map_dimension = st.sidebar.radio("Map Dimension", ["2D", "3D"], index=0, horizontal=True)
         show_labels = st.sidebar.checkbox("Show Island Labels", value=True)
         min_cluster_size = st.sidebar.slider("Min Cards per Island", 3, 20, 5)
         custom_neighbors = st.sidebar.slider("Map Detail (Neighbors)", 5, 50, 15)
@@ -930,7 +931,7 @@ with mapping:
         }
 
         if len(map_df) > 30:
-            with st.spinner("Generating dense semantic embeddings and mapping the knowledge space..."):
+            with st.spinner(f"Generating dense semantic embeddings and mapping the {map_dimension} knowledge space..."):
 
                 # 2. Load Local Embedding Model
                 @st.cache_resource
@@ -965,10 +966,12 @@ with mapping:
                 import hdbscan
                 from sklearn.metrics.pairwise import cosine_similarity
 
-                # 5. UMAP Dimensionality Reduction (3D)
+                # 5. UMAP Dimensionality Reduction (Dynamic 2D or 3D)
                 final_neighbors = min(custom_neighbors, len(map_df) - 1)
+                n_comp = 2 if map_dimension == "2D" else 3
+
                 reducer = umap.UMAP(
-                    n_components=3,
+                    n_components=n_comp,
                     n_neighbors=final_neighbors,
                     min_dist=0.1,
                     metric='cosine',
@@ -978,7 +981,8 @@ with mapping:
 
                 map_df['Map X'] = coords[:, 0]
                 map_df['Map Y'] = coords[:, 1]
-                map_df['Map Z'] = coords[:, 2]
+                if map_dimension == "3D":
+                    map_df['Map Z'] = coords[:, 2]
 
                 # 6. HDBSCAN Density-Based Clustering
                 clusterer = hdbscan.HDBSCAN(
@@ -988,18 +992,15 @@ with mapping:
                 )
                 map_df['cluster'] = clusterer.fit_predict(coords)
 
-                # 7. Extract Semantic Labels (Fixing the IndexError & Trigrams)
+                # 7. Extract Semantic Labels
                 cluster_labels = {}
                 if show_labels:
                     all_stops = GLOBAL_STOP_WORDS
 
                     grouped_docs = map_df.groupby('cluster')['nlp_ready'].apply(lambda x: ' '.join(x)).reset_index()
-
-                    # FIX: Filter out noise (-1) AND reset the index so it matches the 0-based SciPy matrix
                     valid_docs = grouped_docs[grouped_docs['cluster'] != -1].reset_index(drop=True)
 
                     if not valid_docs.empty:
-                        # Restored ngram_range=(1, 3) for highly specific medical/scientific labels
                         vectorizer = TfidfVectorizer(stop_words='english', max_features=1000, ngram_range=(1, 3))
                         tfidf_matrix = vectorizer.fit_transform(valid_docs['nlp_ready'])
                         feature_names = vectorizer.get_feature_names_out()
@@ -1012,8 +1013,6 @@ with mapping:
                             best_label = f"Concept {cluster_id}"
                             for idx in top_indices:
                                 candidate = feature_names[idx]
-
-                                # Safeguard against bad tokens
                                 has_stop = any(stop in candidate for stop in all_stops)
                                 has_digit = any(char.isdigit() for char in candidate)
                                 has_underscore = '_' in candidate
@@ -1025,69 +1024,107 @@ with mapping:
 
                 # 8. Build the Semantic Web (Edges)
                 sim_matrix = cosine_similarity(embeddings)
-                edge_x = []
-                edge_y = []
-                edge_z = []
+                edge_x, edge_y, edge_z = [], [], []
 
-                # Loop to find connections and build the line trace (upper triangle to avoid duplicates)
                 for i in range(len(map_df)):
                     for j in range(i + 1, len(map_df)):
                         if sim_matrix[i, j] > edge_threshold:
                             edge_x.extend([map_df['Map X'].iloc[i], map_df['Map X'].iloc[j], None])
                             edge_y.extend([map_df['Map Y'].iloc[i], map_df['Map Y'].iloc[j], None])
-                            edge_z.extend([map_df['Map Z'].iloc[i], map_df['Map Z'].iloc[j], None])
+                            if map_dimension == "3D":
+                                edge_z.extend([map_df['Map Z'].iloc[i], map_df['Map Z'].iloc[j], None])
 
-                # 9. Final 3D Plot Assembly
-                            # 9. Final 3D Plot Assembly
-                            fig_map = px.scatter_3d(
-                                map_df, x='Map X', y='Map Y', z='Map Z',
-                                color='Mastery_Zone',
-                                color_discrete_map=mastery_colors,
-                                category_orders={
-                                    "Mastery_Zone": ["Mastered", "Known", "Problematic", "Danger", "Not Known"]},
-                                # Forces legend order
-                                hover_name='deck_name',
-                                hover_data={
-                                    'Map X':        False, 'Map Y': False, 'Map Z': False,
-                                    'clean_text':   True,
-                                    'Mastery_Zone': True,
-                                    'd':            ':.1f',
-                                    's':            ':.1f',
-                                    'cluster':      True
-                                },
-                                opacity=0.9, height=800
-                            )
+                # 9. Final Plot Assembly
+                                # 9. Final Plot Assembly
+                if map_dimension == "2D":
+                    fig_map = px.scatter(
+                        map_df, x='Map X', y='Map Y',
+                        color='Mastery_Zone', color_discrete_map=mastery_colors,
+                        category_orders={"Mastery_Zone": ["Mastered", "Known", "Problematic", "Danger",
+                                                          "Not Known"]},
+                        hover_name='deck_name',
+                        hover_data={'Map X':        False, 'Map Y': False, 'clean_text': True,
+                                    'Mastery_Zone': True, 'd': ':.1f', 's': ':.1f', 'cluster': True},
+                        opacity=0.9, height=800
+                    )
 
-                # Add the Web Layer (Lines)
-                fig_map.add_trace(go.Scatter3d(
-                    x=edge_x, y=edge_y, z=edge_z,
-                    mode='lines',
-                    line=dict(color='rgba(150, 150, 150, 0.2)', width=1),
-                    hoverinfo='none',
-                    showlegend=False
-                ))
+                    # Add the Web Layer (Lines)
+                    fig_map.add_trace(go.Scatter(
+                        x=edge_x, y=edge_y, mode='lines',
+                        line=dict(color='rgba(150, 150, 150, 0.2)', width=1),
+                        hoverinfo='skip', showlegend=False  # Changed to skip
+                    ))
 
-                # Add the Text Labels Layer
-                if show_labels:
-                    centers = map_df[map_df['cluster'] != -1].groupby('cluster')[
-                        ['Map X', 'Map Y', 'Map Z']].mean().reset_index()
-                    for _, row in centers.iterrows():
-                        label = cluster_labels.get(row['cluster'], "")
-                        fig_map.add_trace(go.Scatter3d(
-                            x=[row['Map X']], y=[row['Map Y']], z=[row['Map Z']],
-                            mode='text',
-                            text=[f"<b>{label}</b>"],
-                            textfont=dict(color='white', size=14),
-                            showlegend=False,
-                            hoverinfo='none'
-                        ))
+                    # LAYER HACK: Move the newly added line trace to the bottom of the stack
+                    fig_map.data = (fig_map.data[-1],) + fig_map.data[:-1]
 
-                fig_map.update_traces(marker=dict(size=4))
-                fig_map.update_layout(scene=dict(
-                    xaxis=dict(showbackground=False, showticklabels=False, title=''),
-                    yaxis=dict(showbackground=False, showticklabels=False, title=''),
-                    zaxis=dict(showbackground=False, showticklabels=False, title='')
-                ))
+                    # Add the Text Labels Layer (On top, but ghosted to mouse)
+                    if show_labels:
+                        centers = map_df[map_df['cluster'] != -1].groupby('cluster')[
+                            ['Map X', 'Map Y']].mean().reset_index()
+                        for _, row in centers.iterrows():
+                            label = cluster_labels.get(row['cluster'], "")
+                            fig_map.add_trace(go.Scatter(
+                                x=[row['Map X']], y=[row['Map Y']], mode='text',
+                                text=[f"<b>{label}</b>"], textfont=dict(color='white', size=14),
+                                showlegend=False, hoverinfo='skip'  # Changed to skip
+                            ))
+
+                    # Target only markers to avoid altering lines/text
+                    fig_map.update_traces(
+                        marker=dict(size=6, line=dict(width=0.5, color='rgba(0,0,0,0.5)')),
+                        selector=dict(mode='markers')
+                    )
+
+                    fig_map.update_layout(
+                        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, title=''),
+                        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, title=''),
+                        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)'
+                    )
+
+                else:  # 3D rendering
+                    fig_map = px.scatter_3d(
+                        map_df, x='Map X', y='Map Y', z='Map Z',
+                        color='Mastery_Zone', color_discrete_map=mastery_colors,
+                        category_orders={"Mastery_Zone": ["Mastered", "Known", "Problematic", "Danger",
+                                                          "Not Known"]},
+                        hover_name='deck_name',
+                        hover_data={'Map X':        False, 'Map Y': False, 'Map Z': False,
+                                    'clean_text':   True, 'Mastery_Zone': True, 'd': ':.1f',
+                                    's':            ':.1f', 'cluster': True},
+                        opacity=0.9, height=800
+                    )
+
+                    # Add the Web Layer
+                    fig_map.add_trace(go.Scatter3d(
+                        x=edge_x, y=edge_y, z=edge_z, mode='lines',
+                        line=dict(color='rgba(150, 150, 150, 0.2)', width=1),
+                        hoverinfo='skip', showlegend=False
+                    ))
+
+                    # LAYER HACK: Move the lines to the bottom of the stack
+                    fig_map.data = (fig_map.data[-1],) + fig_map.data[:-1]
+
+                    if show_labels:
+                        centers = map_df[map_df['cluster'] != -1].groupby('cluster')[
+                            ['Map X', 'Map Y', 'Map Z']].mean().reset_index()
+                        for _, row in centers.iterrows():
+                            label = cluster_labels.get(row['cluster'], "")
+                            fig_map.add_trace(go.Scatter3d(
+                                x=[row['Map X']], y=[row['Map Y']], z=[row['Map Z']], mode='text',
+                                text=[f"<b>{label}</b>"], textfont=dict(color='white', size=14),
+                                showlegend=False, hoverinfo='skip'
+                            ))
+
+                    # Target only markers
+                    fig_map.update_traces(marker=dict(size=4), selector=dict(mode='markers'))
+
+                    fig_map.update_layout(scene=dict(
+                        xaxis=dict(showbackground=False, showticklabels=False, title=''),
+                        yaxis=dict(showbackground=False, showticklabels=False, title=''),
+                        zaxis=dict(showbackground=False, showticklabels=False, title='')
+                    ))
+
                 st.plotly_chart(fig_map, use_container_width=True)
 
                 # 10. Target Acquisition Metrics (Top 3 Hardest Islands)
@@ -1122,9 +1159,11 @@ with mapping:
 
     with subtab_Meta:
         st.markdown("""
-        ### FSRS Principal Component Analysis (PCA) & Clustering
-        This map uses **PCA** to reduce your raw FSRS stats down to 3 core dimensions. 
-        Instead of a black-box AI algorithm, PCA creates linear axes that mathematically explain the most variance in your study habits. 
+        ### Explicit FSRS Heuristic Space
+        This map plots cards directly across the three core dimensions of spaced repetition memory.
+        * **X-Axis (Memory Depth):** Stability (Log-scaled). Cards moving right are solidifying into long-term memory.
+        * **Y-Axis (Cognitive Friction):** FSRS Difficulty (1-10). Cards moving up are fundamentally harder concepts.
+        * **Z-Axis (Struggle Rate):** Historical failure rate (Lapses ÷ Reps). 
         """)
 
         # 1. Define FSRS features
@@ -1134,38 +1173,59 @@ with mapping:
         pca_df = filtered_cards.dropna(subset=['d', 's']).copy()
 
         if len(pca_df) > 15 and len(available_f) >= 3:
-            with st.spinner("Running PCA and K-Means on FSRS attributes..."):
+            with st.spinner(f"Mapping explicit FSRS dimensions in {map_dimension}..."):
                 from sklearn.preprocessing import StandardScaler
-                from sklearn.decomposition import PCA
                 from sklearn.cluster import KMeans
+                import numpy as np
 
-                # 2. Impute and Scale
+                # 2. Impute missing values
                 for f in available_f:
                     median_val = pca_df[f].median()
                     pca_df[f] = pca_df[f].fillna(median_val if not pd.isna(median_val) else 0)
 
                 final_pca_df = pca_df.dropna(subset=available_f).copy()
+
+                # 3. Feature Engineering for Explicit Axes
+                final_pca_df['s_plot'] = final_pca_df['s'].clip(lower=0.1)
+
+                final_pca_df['lapse_rate'] = np.where(
+                    final_pca_df['reps'] > 0,
+                    (final_pca_df['lapses'] / final_pca_df['reps']) * 100,
+                    0
+                )
+
+                final_pca_df['marker_size'] = final_pca_df['reps'].clip(lower=3, upper=50)
+
+                # --- NEW: VISUAL JITTER ---
+                # We add random noise to the plot coordinates to break up the "shelves",
+                # but keep the exact values for the hover tooltips.
+                final_pca_df['d_plot'] = final_pca_df['d'] + np.random.normal(0, 0.15, size=len(final_pca_df))
+                final_pca_df['lapse_rate_plot'] = final_pca_df['lapse_rate'] + np.random.normal(0, 1.5,
+                                                                                                size=len(final_pca_df))
+
+                # 4. K-Means Clustering
+                skewed_features = [f for f in ['s', 'ivl', 'reps', 'lapses'] if f in available_f]
+                for f in skewed_features:
+                    final_pca_df[f"{f}_log"] = np.log1p(final_pca_df[f])
+
+                features_for_scaling = [f for f in ['d'] if f in available_f] + [f"{f}_log" for f in skewed_features]
+
                 scaler = StandardScaler()
-                fsrs_scaled = scaler.fit_transform(final_pca_df[available_f])
+                fsrs_scaled = scaler.fit_transform(final_pca_df[features_for_scaling])
 
-                # 3. Apply PCA (3 Components)
-                pca = PCA(n_components=3)
-                pca_coords = pca.fit_transform(fsrs_scaled)
-
-                final_pca_df['PC1'] = pca_coords[:, 0]
-                final_pca_df['PC2'] = pca_coords[:, 1]
-                final_pca_df['PC3'] = pca_coords[:, 2]
-
-                # 4. K-Means Clustering on the Scaled Data
                 n_clusters = min(5, len(final_pca_df))
                 kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
                 final_pca_df['Cluster_ID'] = kmeans.fit_predict(fsrs_scaled)
 
-                # 5. Interpret Clusters (Generate Names based on actual centroids)
-                # We inverse_transform the centers back to raw FSRS values so they make sense
-                centers_raw = pd.DataFrame(scaler.inverse_transform(kmeans.cluster_centers_), columns=available_f)
-                cluster_names = {}
+                # 5. Interpret Clusters
+                centers_scaled = kmeans.cluster_centers_
+                centers_log = scaler.inverse_transform(centers_scaled)
+                centers_raw = pd.DataFrame(centers_log, columns=features_for_scaling)
 
+                for f in skewed_features:
+                    centers_raw[f] = np.expm1(centers_raw[f"{f}_log"])
+
+                cluster_names = {}
                 avg_lapses = final_pca_df['lapses'].mean()
                 avg_reps = final_pca_df['reps'].mean()
 
@@ -1183,23 +1243,8 @@ with mapping:
 
                 final_pca_df['FSRS_Profile'] = final_pca_df['Cluster_ID'].map(cluster_names)
 
-                # 6. Extract PCA Loadings to dynamically name the axes
-                loadings = pd.DataFrame(pca.components_.T, columns=['PC1', 'PC2', 'PC3'], index=available_f)
 
-
-                def get_axis_label(pc_col):
-                    # Find the FSRS metric that pulls the hardest on this axis
-                    top_feature = loadings[pc_col].abs().idxmax()
-                    direction = "+" if loadings.loc[top_feature, pc_col] > 0 else "-"
-                    return f"{pc_col} (Driven by {direction}{top_feature.upper()})"
-
-
-                ax_x = get_axis_label('PC1')
-                ax_y = get_axis_label('PC2')
-                ax_z = get_axis_label('PC3')
-
-
-                # 7. Semantic Extraction for the hover tooltip
+                # 6. Semantic Extraction for the hover tooltip
                 def get_point_concept(text, tags):
                     raw = f"{text} {tags}"
                     text_no_nums = re.sub(r'\d+', '', str(raw).lower())
@@ -1211,74 +1256,87 @@ with mapping:
                 final_pca_df['Concept'] = final_pca_df.apply(lambda x: get_point_concept(x['clean_text'], x['tags']),
                                                              axis=1)
 
-                # 8. Render the 3D PCA Plot
-                fig_pca = px.scatter_3d(
-                    final_pca_df, x='PC1', y='PC2', z='PC3',
-                    color='FSRS_Profile',
-                    size='d',  # Scale node size by Difficulty
-                    hover_name='Concept',
-                    hover_data={
-                        'clean_text': True,
-                        'deck_name':  True,
-                        'd':          ':.1f',
-                        's':          ':.1f',
-                        'lapses':     True,
-                        'reps':       True,
-                        'ivl':        True,
-                        'PC1':        False, 'PC2': False, 'PC3': False, 'Cluster_ID': False
-                    },
-                    opacity=0.85, height=800,
-                    color_discrete_sequence=px.colors.qualitative.Bold
-                )
+                # 7. Render the Explicit Domain Map
+                if map_dimension == "2D":
+                    fig_meta = px.scatter(
+                        final_pca_df,
+                        x='s_plot',
+                        y='d_plot',  # Using jittered Y
+                        color='FSRS_Profile',
+                        size='marker_size',
+                        hover_name='Concept',
+                        hover_data={
+                            'clean_text':  True, 'deck_name': True,
+                            'd':           ':.1f',  # Hover shows REAL difficulty
+                            's':           ':.1f',
+                            'lapses':      True, 'reps': True,
+                            'lapse_rate':  ':.1f%',  # Hover shows REAL lapse rate
+                            's_plot':      False, 'd_plot': False, 'lapse_rate_plot': False,
+                            'marker_size': False, 'Cluster_ID': False
+                        },
+                        opacity=0.7, height=800,  # Lowered opacity slightly to see density
+                        color_discrete_sequence=px.colors.qualitative.Bold
+                    )
 
-                fig_pca.update_layout(
-                    scene=dict(
-                        xaxis_title=ax_x,
-                        yaxis_title=ax_y,
-                        zaxis_title=ax_z
-                    ),
-                    legend=dict(title='FSRS Archetype', yanchor="top", y=0.99, xanchor="left", x=0.01)
-                )
+                    fig_meta.update_layout(
+                        xaxis_title="Memory Depth (Stability in Days)",
+                        yaxis_title="Cognitive Friction (Difficulty 1-10)",
+                        legend=dict(title='FSRS Archetype', yanchor="top", y=0.99, xanchor="left", x=0.01)
+                    )
+                    fig_meta.update_xaxes(type="log", tickvals=[0.1, 1, 3, 7, 21, 90, 365],
+                                          ticktext=["New", "1d", "3d", "1w", "3w", "3m", "1y"])
+                    fig_meta.update_traces(marker=dict(line=dict(width=0.5, color='rgba(0,0,0,0.5)')))
 
-                # Minimum size to ensure easy cards don't vanish
-                fig_pca.update_traces(marker=dict(sizemin=3, line=dict(width=0.5, color='DarkSlateGrey')))
+                else:  # 3D rendering
+                    fig_meta = px.scatter_3d(
+                        final_pca_df,
+                        x='s_plot',
+                        y='d_plot',  # Using jittered Y
+                        z='lapse_rate_plot',  # Using jittered Z
+                        color='FSRS_Profile',
+                        size='marker_size',
+                        hover_name='Concept',
+                        hover_data={
+                            'clean_text':  True, 'deck_name': True,
+                            'd':           ':.1f',  # Hover shows REAL difficulty
+                            's':           ':.1f',
+                            'lapses':      True, 'reps': True,
+                            'lapse_rate':  ':.1f%',  # Hover shows REAL lapse rate
+                            's_plot':      False, 'd_plot': False, 'lapse_rate_plot': False,
+                            'marker_size': False, 'Cluster_ID': False
+                        },
+                        opacity=0.7, height=800,  # Lowered opacity slightly to see density
+                        color_discrete_sequence=px.colors.qualitative.Bold
+                    )
 
-                st.plotly_chart(fig_pca, use_container_width=True)
+                    fig_meta.update_layout(
+                        scene=dict(
+                            xaxis=dict(type="log", title="Memory Depth (Stability)", tickvals=[0.1, 1, 7, 30, 365],
+                                       ticktext=["New", "1d", "1w", "1m", "1y"]),
+                            yaxis_title="Cognitive Friction (Difficulty 1-10)",
+                            zaxis_title="Struggle Rate (% Lapses/Reps)"
+                        ),
+                        legend=dict(title='FSRS Archetype', yanchor="top", y=0.99, xanchor="left", x=0.01)
+                    )
+                    fig_meta.update_traces(marker=dict(line=dict(width=0.5, color='DarkSlateGrey')))
+
+                st.plotly_chart(fig_meta, use_container_width=True)
 
                 st.divider()
 
-                # 9. Explained Variance & Loadings Matrix Output
-                col_exp, col_load = st.columns([1, 2])
-                with col_exp:
-                    st.subheader("📊 Explained Variance")
-                    st.markdown("How much of your total learning history is captured by each axis.")
-                    var_df = pd.DataFrame({
-                        'Principal Component': ['PC1', 'PC2', 'PC3'],
-                        'Variance Explained':  pca.explained_variance_ratio_ * 100
-                    })
-                    fig_var = px.bar(var_df, x='Principal Component', y='Variance Explained', text_auto=':.1f')
-                    fig_var.update_traces(textposition='outside')
-                    fig_var.update_layout(yaxis_title="% Variance Explained", height=300)
-                    st.plotly_chart(fig_var, use_container_width=True)
-
-                with col_load:
-                    st.subheader("🧠 Component Loadings")
-                    st.markdown(
-                        "Values further from zero mean that FSRS attribute strongly pulls the card along that axis.")
-                    # Color format the dataframe for easy reading
-                    st.dataframe(loadings.style.background_gradient(cmap='RdBu', vmin=-1, vmax=1),
-                                 use_container_width=True)
-
-                # 10. Show Raw Cluster Centroids
+                # 8. Show Raw Cluster Centroids
                 st.subheader("📋 FSRS Cluster Profiles (Averages)")
-                centers_raw.index = [cluster_names.get(i, f"Cluster {i}") for i in centers_raw.index]
-                st.dataframe(centers_raw.sort_values('d', ascending=False).style.format("{:.2f}"),
+
+                cols_to_drop = [f"{f}_log" for f in skewed_features if f"{f}_log" in centers_raw.columns]
+                display_centers = centers_raw.drop(columns=cols_to_drop).copy()
+                display_centers.index = [cluster_names.get(i, f"Cluster {i}") for i in display_centers.index]
+
+                st.dataframe(display_centers.sort_values('d', ascending=False).style.format("{:.2f}"),
                              use_container_width=True)
 
         else:
-            st.info("Not enough FSRS parameters to run PCA. Keep studying!")
+            st.info("Not enough FSRS parameters to run the mapping. Keep studying!")
 
-# --- TAB 7: MASTER READINESS & CALIBRATION ---
 # --- TAB 7: MASTER READINESS & CALIBRATION ---
 with tab7:
     st.subheader("🎯 Master Readiness & FSRS Calibration")
