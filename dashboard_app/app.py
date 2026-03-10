@@ -1408,27 +1408,31 @@ with tab7:
         # 1. ADD THE MISSING COLUMN
         cluster_df['Exam'] = 'April 14 Exam'
 
-        # 2. Split the deck name hierarchy
+        # 2. Split using YOUR original arrow delimiter!
+        # Make sure the arrow character and spaces exactly match your dataframe
         cluster_df['levels'] = cluster_df['deck_name'].str.split(' ➔ ')
-        cluster_df['Deck_L1'] = cluster_df['levels'].apply(lambda x: x[0] if len(x) > 0 else None)
-        cluster_df['Deck_L2'] = cluster_df['levels'].apply(lambda x: x[1] if len(x) > 1 else None)
-        cluster_df['Deck_L3'] = cluster_df['levels'].apply(lambda x: x[2] if len(x) > 2 else None)
 
-        # 3. Dynamic Path Setup
+        # 3. Use '(Direct)' to balance the tree, and .strip() to clean up spaces
+        cluster_df['Deck_L1'] = cluster_df['levels'].apply(
+            lambda x: x[0].strip() if isinstance(x, list) and len(x) > 0 else 'Unknown')
+        cluster_df['Deck_L2'] = cluster_df['levels'].apply(
+            lambda x: x[1].strip() if isinstance(x, list) and len(x) > 1 else '(Direct)')
+        cluster_df['Deck_L3'] = cluster_df['levels'].apply(
+            lambda x: x[2].strip() if isinstance(x, list) and len(x) > 2 else '(Direct)')
+
+        # 4. Dynamic Path Setup
         path_hierarchy = ['Exam', 'Deck_L1', 'Deck_L2', 'Deck_L3', 'knowledge_state']
-        # Filter path to only include columns that actually exist and aren't all null
-        actual_path = [p for p in path_hierarchy if p in cluster_df.columns and cluster_df[p].notnull().any()]
 
-        # 4. Group and Aggregate
-        cluster_stats = cluster_df.groupby(actual_path).agg(
+        # 5. Group and Aggregate
+        cluster_stats = cluster_df.groupby(path_hierarchy).agg(
             card_count=('id', 'count'),
             avg_difficulty=('d', 'mean')
         ).reset_index()
 
-        # 5. Create the multi-layer Sunburst
+        # 6. Create the multi-layer Sunburst
         fig_cluster = px.sunburst(
             cluster_stats,
-            path=actual_path,
+            path=path_hierarchy,
             values='card_count',
             color='avg_difficulty',
             color_continuous_scale='RdYlGn_r',
@@ -1438,7 +1442,6 @@ with tab7:
 
         fig_cluster.update_layout(margin=dict(t=20, l=10, r=10, b=10), height=750)
         st.plotly_chart(fig_cluster, use_container_width=True)
-
 
 
 
