@@ -201,6 +201,8 @@ else:
     filtered_cards = cards_df
     filtered_revlog = revlog_df
 
+map_df = None
+
 state_colors = {
     'Unseen':       '#9ca3af', 'Learning': '#facc15', 'Seen': '#fb923c',
     'Intermediate': '#60a5fa', 'Known': '#22c55e'
@@ -267,8 +269,8 @@ st.divider()
 # ==========================================
 # DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, mapping, tab7 = st.tabs([
-    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness"])
+tab1, tab2, tab3, tab4, mapping, tab7, tab8 = st.tabs([
+    "📈 Overview", "🔮 Future Workload", "⏱️ Study Optimization", "🏷️ Difficulty", "🌌 3D Maps", "🎯 Readiness", "Filter Generator"])
 
 # --- TAB 1: OVERVIEW ---
 with tab1:
@@ -792,11 +794,15 @@ with tab3:
 
 
 
+
+
 # --- TAB 4: TAG ANALYTICS ---
 with tab4:
     st.subheader("🏷️ Subject Difficulty by Tag")
 
     tag_df = filtered_cards.dropna(subset=['d', 'tags']).copy()
+
+
 
     if not tag_df.empty:
         # 1. NEW CLEANING LOGIC: Split by space OR underscore
@@ -865,6 +871,78 @@ with tab4:
                      'due_date':   'Anki Due Date'})
         st.dataframe(problem_cards, use_container_width=True, hide_index=True, height=500)
 
+    st.divider()
+    st.subheader("🧭 Knowledge Gaps (Under-Explored Domains)")
+    st.markdown(
+        "Tags with a high volume of cards, but a large percentage remaining **Unseen** or with very few reviews. These are your blind spots.")
+
+    # 1. Create a NEW dataframe that doesn't drop 'd' (so we keep Unseen cards)
+    explore_df = filtered_cards.dropna(subset=['tags']).copy()
+
+    if not explore_df.empty:
+        # Split tags just like before
+        explore_df['tag_list'] = explore_df['tags'].astype(str).str.strip().str.split(r'[ _]')
+        exploded_explore = explore_df.explode('tag_list')
+
+        # Re-use your filter function
+        exploded_explore = exploded_explore[exploded_explore['tag_list'].apply(is_useful_tag)]
+
+        if not exploded_explore.empty:
+            # 2. Calculate Exploration Metrics
+            exploration_stats = exploded_explore.groupby('tag_list').agg(
+                total_cards=('id', 'count'),
+                unseen_cards=('knowledge_state', lambda x: (x == 'Unseen').sum()),
+                avg_reps=('reps', lambda x: x.fillna(0).mean())  # Unseen cards have NaN reps
+            ).reset_index()
+
+            # 3. Calculate % Unseen and a "Priority Score"
+            # Priority Score = Volume of Unseen Cards * Percentage of Unseen
+            # This surfaces tags that have BOTH a lot of hidden cards AND are heavily ignored
+            exploration_stats['unseen_pct'] = (exploration_stats['unseen_cards'] / exploration_stats['total_cards']) * 100
+
+            blind_spots = exploration_stats[
+                (exploration_stats['total_cards'] >= 5) &
+                (exploration_stats['unseen_cards'] > 0)
+                ].copy()
+
+            if not blind_spots.empty:
+                blind_spots['priority_score'] = blind_spots['unseen_cards'] * blind_spots['unseen_pct']
+                top_blind_spots = blind_spots.sort_values(by='priority_score', ascending=False).head(15)
+
+                col_gap_chart, col_gap_data = st.columns([3, 2])
+
+                with col_gap_chart:
+                    # Scatter plot showing Volume vs. Unexplored Percentage
+                    fig_gaps = px.scatter(
+                        top_blind_spots,
+                        x='total_cards',
+                        y='unseen_pct',
+                        size='unseen_cards',
+                        color='unseen_pct',
+                        hover_name='tag_list',
+                        text='tag_list',
+                        color_continuous_scale='Purples',
+                        labels={'total_cards': 'Total Cards in Concept', 'unseen_pct': '% Unseen'},
+                        title="Blind Spot Matrix"
+                    )
+                    fig_gaps.update_traces(textposition='top center')
+                    fig_gaps.update_layout(yaxis=dict(range=[0, 110]))  # Give labels room to breathe
+                    st.plotly_chart(fig_gaps, use_container_width=True)
+
+                with col_gap_data:
+                    display_gaps = top_blind_spots[['tag_list', 'total_cards', 'unseen_cards', 'unseen_pct']].rename(
+                        columns={
+                            'tag_list':     'Concept Tag',
+                            'total_cards':  'Total',
+                            'unseen_cards': 'Unseen',
+                            'unseen_pct':   '% Unseen'
+                        })
+
+                    st.dataframe(
+                        display_gaps.style.background_gradient(subset=['% Unseen'], cmap='Purples', vmin=0, vmax=100)
+                        .format({'% Unseen': "{:.1f}%"}),
+                        use_container_width=True, hide_index=True
+                    )
 
 
 
@@ -1444,6 +1522,230 @@ with tab7:
         st.plotly_chart(fig_cluster, use_container_width=True)
 
 
+with tab8:
+    # ==========================================
+    # 🧠 ADVANCED ANKI ACTION CENTER
+    # ==========================================
+    st.divider()
+    st.header("🧠 Strategic Action Center")
+    st.markdown(
+        "Bridge your dashboard's machine learning insights directly into Anki. Review the strategy guide below, then generate your custom Filtered Deck payload.")
+
+    # --- 1. STRATEGY DICTIONARY (Metadata & Explanations) ---
+    STRATEGIES = {
+        "The Quarantine (High Friction + Leeches)":       {
+            "target":       "Isolate concepts that cause structural cognitive friction (Difficulty >= 8 & failed multiple times).",
+            "instructions": "1. Create this deck at the **end of your study day**.\n2. Do not just spam 'Hard' or 'Again'.\n3. If you fail a card here, edit the note—rewrite it, add context, or break it down."
+        },
+        "Fragile Knowledge (Low Stability, Due Soon)":    {
+            "target":       "Intercept memory decay. Targets cards due in the next 5 days with a memory stability (S) of less than a week.",
+            "instructions": "1. Use this as a **warm-up deck** before your main reviews.\n2. By hitting these fragile memories early, you prevent them from lapsing and resetting your progress."
+        },
+        "Exam Cram (Overdue + Hard)":                     {
+            "target":       "High-yield triage. Filters out the easy stuff and forces you to confront the hardest overdue material first.",
+            "instructions": "1. Use **only when overwhelmed** by your Anki due count.\n2. Clear this filtered deck first, then delete the deck and let Anki feed you the easy backlog normally."
+        },
+        "Uncover Blind Spots (Tag-Based)":                {
+            "target":       "Force initiation of your most neglected manual categories by targeting tags with the highest volume of 'Unseen' cards.",
+            "instructions": "1. Use this when you have dedicated time to **learn new material**.\n2. Turn off regular 'New Cards' in your Anki settings, and exclusively use this to chip away at knowledge gaps."
+        },
+        "The Neural Oracle (Cursed Concepts)":            {
+            "target":       "Preemptively tackle upcoming cards with historical failure rates > 15%, bypassing the standard FSRS schedule.",
+            "instructions": "1. Run this **2-3 days before your exam**.\n2. These cards are highly toxic to your retention. Review them out of cycle to ensure they are top-of-mind."
+        },
+        "Semantic Dark Matter (AI Unseen Cluster)":       {
+            "target":       "Attack the densest HDBSCAN semantic cluster of entirely unstudied material. Bypasses manual tags to group cards by text similarity.",
+            "instructions": "1. Dive deep into a single, highly related topic you haven't touched yet.\n2. **Important:** In Anki's Filtered Deck settings, select 'Reschedule cards based on my answers'."
+        },
+        "The Volcano (AI Hardest Cluster)":               {
+            "target":       "Deep-dive into the semantic island with the highest average cognitive friction (FSRS Difficulty).",
+            "instructions": "1. Use this when you are heavily caffeinated and ready for pain.\n2. This pulls the hardest *topic*, not just random hard cards, allowing you to build contextual understanding."
+        },
+        "The Reconnaissance Survey (Distinct New Cards)": {
+            "target":       "Sample random, unexplored cards across completely different semantic topics to prevent cognitive interference.",
+            "instructions": "1. Safely survey the landscape of your blind spots.\n2. Pulls exactly one card from distinct islands (ranked by topic difficulty), forcing your brain to interleave disparate concepts."
+        }
+    }
+
+    # --- 2. DISPLAY STRATEGY GUIDE UPFRONT ---
+    st.markdown("### 📖 Strategy Guide")
+    guide_col1, guide_col2 = st.columns(2)
+
+    # Dynamically render the dictionary into a 2-column grid
+    strat_keys = list(STRATEGIES.keys())
+    for i, strat_name in enumerate(strat_keys):
+        col = guide_col1 if i % 2 == 0 else guide_col2
+        with col:
+            st.info(
+                f"**{strat_name}**\n\n**🎯 Target:** {STRATEGIES[strat_name]['target']}\n\n**⚙️ Execution:**\n{STRATEGIES[strat_name]['instructions']}")
+
+    st.divider()
+
+    # --- 3. GENERATOR UI ---
+    st.markdown("### 🛠️ Query Generator")
+    col_sel, col_param = st.columns([2, 1])
+
+    with col_sel:
+        study_strategy = st.selectbox("Select Cognitive Strategy:", strat_keys)
+
+    with col_param:
+        cid_limit = st.slider(
+            "Max Cards to Pull",
+            min_value=10, max_value=150, value=50, step=10,
+            help="Anki's search bar can freeze if you pass it thousands of card IDs. Keep this under 150 for smooth performance."
+        )
+
+    # --- 4. LOGIC & STRING GENERATION ---
+    deck_str = f'"deck:{selected_deck}" ' if selected_deck != "All Decks" else ""
+    filter_string = ""
+
+    if study_strategy == "The Quarantine (High Friction + Leeches)":
+        filter_string = f"{deck_str}is:review prop:d>=8 prop:lapses>=2"
+
+    elif study_strategy == "Fragile Knowledge (Low Stability, Due Soon)":
+        filter_string = f"{deck_str}is:review prop:s<7 prop:due<=5"
+
+    elif study_strategy == "Exam Cram (Overdue + Hard)":
+        filter_string = f"{deck_str}is:due prop:due<0 prop:d>=7"
+
+    elif study_strategy == "Uncover Blind Spots (Tag-Based)":
+        explore_df = filtered_cards.dropna(subset=['tags']).copy()
+        if not explore_df.empty:
+            explore_df['tag_list'] = explore_df['tags'].astype(str).str.strip().str.split(r'[ _]')
+            exploded = explore_df.explode('tag_list')
 
 
+            def is_useful_local(t):
+                t = str(t).lower().strip()
+                return len(t) >= 3 and t not in GLOBAL_STOP_WORDS and not (
+                            any(c.isdigit() for c in t) and any(c.isalpha() for c in t) and len(t) > 5)
 
+
+            exploded = exploded[exploded['tag_list'].apply(is_useful_local)]
+            if not exploded.empty:
+                stats = exploded.groupby('tag_list').agg(
+                    total_cards=('id', 'count'),
+                    unseen=('knowledge_state', lambda x: (x == 'Unseen').sum())
+                ).reset_index()
+
+                blind_spots = stats[(stats['total_cards'] >= 5) & (stats['unseen'] > 0)].copy()
+                if not blind_spots.empty:
+                    blind_spots['priority'] = blind_spots['unseen'] * (
+                                blind_spots['unseen'] / blind_spots['total_cards'])
+                    top_tags = blind_spots.sort_values(by='priority', ascending=False).head(4)['tag_list'].tolist()
+                    tag_cluster = " OR ".join([f"tag:*{t}*" for t in top_tags])
+                    filter_string = f"{deck_str}is:new ({tag_cluster})"
+                else:
+                    filter_string = "No tag-based blind spots detected."
+            else:
+                filter_string = "No usable tags found."
+
+    elif study_strategy == "The Neural Oracle (Cursed Concepts)":
+        today = get_local_today()
+        future_3_days = today + timedelta(days=3)
+        cursed_df = filtered_cards[
+            (filtered_cards['due_date'].notna()) & (filtered_cards['due_date'] <= future_3_days) & (
+                        filtered_cards['reps'] > 3)].copy()
+
+        if not cursed_df.empty:
+            cursed_df['failure_rate'] = cursed_df['lapses'] / cursed_df['reps']
+            true_cursed = cursed_df[cursed_df['failure_rate'] > 0.15].sort_values(by='failure_rate', ascending=False)
+            if not true_cursed.empty:
+                cids = true_cursed['id'].head(cid_limit).astype(str).tolist()
+                filter_string = f"{deck_str}is:due (cid:" + " OR cid:".join(cids) + ")"
+            else:
+                filter_string = "No cursed concepts due soon! You are safe."
+        else:
+            filter_string = "Not enough review history to calculate cursed concepts."
+
+    elif study_strategy == "Semantic Dark Matter (AI Unseen Cluster)":
+        if 'map_df' in globals() and map_df is not None and not map_df.empty and 'cluster' in map_df.columns:
+            valid_clusters = map_df[map_df['cluster'] != -1].copy()
+            if not valid_clusters.empty:
+                cluster_stats = valid_clusters.groupby('cluster').agg(
+                    unseen_count=('knowledge_state', lambda x: (x == 'Unseen').sum())
+                ).reset_index()
+
+                dark_cluster = cluster_stats.sort_values(by='unseen_count', ascending=False).iloc[0]
+                if dark_cluster['unseen_count'] > 0:
+                    dark_cards = valid_clusters[(valid_clusters['cluster'] == dark_cluster['cluster']) & (
+                                valid_clusters['knowledge_state'] == 'Unseen')]
+                    cids = dark_cards['id'].head(cid_limit).astype(str).tolist()
+                    filter_string = f"{deck_str}is:new (cid:" + " OR cid:".join(cids) + ")"
+                else:
+                    filter_string = "No Unseen cards left in any formed semantic clusters!"
+            else:
+                filter_string = "No semantic clusters formed. View Tab 6 first."
+        else:
+            filter_string = "⚠️ Map data not found. Please view Tab 6 (3D Maps) to generate the semantic clusters first."
+
+    elif study_strategy == "The Volcano (AI Hardest Cluster)":
+        if 'map_df' in globals() and map_df is not None and not map_df.empty and 'cluster' in map_df.columns:
+            valid_clusters = map_df[map_df['cluster'] != -1].copy()
+            if not valid_clusters.empty:
+                cluster_stats = valid_clusters[valid_clusters['d'] > 0].groupby('cluster').agg(
+                    avg_difficulty=('d', 'mean')).reset_index()
+                if not cluster_stats.empty:
+                    hardest_cluster_id = cluster_stats.sort_values(by='avg_difficulty', ascending=False).iloc[0][
+                        'cluster']
+                    today_str = str(get_local_today())
+                    volcano_cards = valid_clusters[
+                        (valid_clusters['cluster'] == hardest_cluster_id) &
+                        ((valid_clusters['due_date'].astype(str) <= today_str) | (
+                                    valid_clusters['knowledge_state'] == 'Unseen'))
+                        ]
+                    if not volcano_cards.empty:
+                        cids = volcano_cards['id'].head(cid_limit).astype(str).tolist()
+                        filter_string = f"{deck_str}(cid:" + " OR cid:".join(cids) + ")"
+                    else:
+                        filter_string = "No due/new cards in your hardest cluster."
+                else:
+                    filter_string = "Not enough difficulty data."
+            else:
+                filter_string = "No semantic clusters formed."
+        else:
+            filter_string = "⚠️ Map data not found. Please view Tab 6 (3D Maps) to generate the semantic clusters first."
+
+    elif study_strategy == "The Reconnaissance Survey (Distinct New Cards)":
+        if 'map_df' in globals() and map_df is not None and not map_df.empty and 'cluster' in map_df.columns:
+            valid_clusters = map_df[map_df['cluster'] != -1].copy()
+            unseen_cards = valid_clusters[valid_clusters['knowledge_state'] == 'Unseen']
+
+            if not unseen_cards.empty:
+                # Get avg difficulty for each cluster to prioritize hardest topics
+                cluster_diffs = valid_clusters[valid_clusters['d'] > 0].groupby('cluster')['d'].mean().to_dict()
+
+                # Group unseen cards by cluster and shuffle them
+                unseen_by_cluster = unseen_cards.groupby('cluster')['id'].apply(
+                    lambda x: list(x.sample(frac=1))).to_dict()
+
+                # Sort clusters by difficulty (hardest distinct topics first)
+                sorted_clusters = sorted(unseen_by_cluster.keys(), key=lambda k: cluster_diffs.get(k, 0), reverse=True)
+
+                cids = []
+                # Round-Robin: take 1 card from each distinct cluster, looping until limit is hit
+                while len(cids) < cid_limit and any(unseen_by_cluster.values()):
+                    for cluster in sorted_clusters:
+                        if len(cids) >= cid_limit:
+                            break
+                        if unseen_by_cluster[cluster]:
+                            cids.append(str(unseen_by_cluster[cluster].pop(0)))
+
+                if cids:
+                    filter_string = f"{deck_str}is:new (cid:" + " OR cid:".join(cids) + ")"
+                else:
+                    filter_string = "Failed to sample new cards."
+            else:
+                filter_string = "No Unseen cards left in any semantic clusters! Great job."
+        else:
+            filter_string = "⚠️ Map data not found. Please view Tab 6 (3D Maps) to generate the semantic clusters first."
+
+    # --- 5. RENDER THE PAYLOAD ---
+    st.markdown("### 📋 Generated Anki Payload")
+    if filter_string.startswith("⚠️") or filter_string.startswith("No") or filter_string.startswith(
+            "Not") or filter_string.startswith("Failed"):
+        st.warning(filter_string)
+    else:
+        st.code(filter_string, language="text")
+        st.caption(
+            "Click the copy icon in the top right of the code block, then paste into Anki's Filtered Deck search bar.")
